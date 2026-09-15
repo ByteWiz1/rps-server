@@ -1,16 +1,21 @@
-const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const { Server } = require('socket.io');
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
 
 const rooms = new Map();
-const clients = new Map();
+const players = new Map();
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -21,183 +26,144 @@ function generateRoomCode() {
   return code;
 }
 
-function sendToClient(clientId, data) {
-  const client = clients.get(clientId);
-  if (client && client.ws.readyState === WebSocket.OPEN) {
-    client.ws.send(JSON.stringify(data));
-  }
-}
+io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+  players.set(socket.id, { room: null, name: 'Player' });
 
-function broadcastToRoom(roomCode, data, excludeClientId = null) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  room.players.forEach(playerId => {
-    if (playerId !== excludeClientId) {
-      sendToClient(playerId, data);
+  socket.emit('connected', { playerId: socket.id });
+
+  socket.on('createRoom', (data) => {
+    const roomCode = generateRoomCode();
+    const room = {
+      code: roomCode,
+      players: [socket.id],
+      moves: {},
+      scores: { [socket.id]: 0 },
+      round: 0,
+    };
+    rooms.set(roomCode, room);
+    players.get(socket.id).room = roomCode;
+    players.get(socket.id).name = data.name || 'Player 1';
+
+    socket.join(roomCode);
+
+    socket.emit('roomCreated', {
+      code: roomCode,
+      playerId: socket.id,
+      playerName: data.name,
+    });
+  });
+
+  socket.on('joinRoom', (data) => {
+    const room = rooms.get(data.code);
+    if (!room) {
+      socket.emit('error', { message: 'Room not found' });
+      return;
     }
-  });
-}
-
-wss.on('connection', (ws) => {
-  const clientId = Math.random().toString(36).substring(2, 10);
-  clients.set(clientId, { ws, room: null, name: 'Player' });
-
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      handleMessage(clientId, data);
-    } catch (error) {
-      console.error('Error parsing message:', error);
+    if (room.players.length >= 2) {
+      socket.emit('error', { message: 'Room is full' });
+      return;
     }
+
+    room.players.push(socket.id);
+    room.scores[socket.id] = 0;
+    players.get(socket.id).room = data.code;
+    players.get(socket.id).name = data.name || 'Player 2';
+
+    socket.join(data.code);
+
+    io.to(data.code).emit('playerJoined', {
+      players: room.players.map(id => ({
+        id,
+        name: players.get(id)?.name || 'Player',
+      })),
+      playerId: socket.id,
+      playerName: data.name,
+    });
   });
 
-  ws.on('close', () => {
-    handleDisconnect(clientId);
-  });
+  socket.on('makeMove', (data) => {
+    const player = players.get(socket.id);
+    if (!player || !player.room) return;
 
-  sendToClient(clientId, { type: 'connected', clientId });
-});
+    const room = rooms.get(player.room);
+    if (!room) return;
 
-function handleMessage(clientId, data) {
-  const client = clients.get(clientId);
-  if (!client) return;
+    room.moves[socket.id] = data.move;
 
-  switch (data.type) {
-    case 'createRoom': {
-      const roomCode = generateRoomCode();
-      const room = {
-        code: roomCode,
-        players: [clientId],
-        moves: {},
-        scores: { [clientId]: 0 },
-        round: 0,
-      };
-      rooms.set(roomCode, room);
-      client.room = roomCode;
-      client.name = data.name || 'Player 1';
+    socket.to(player.room).emit('playerMoved', { playerId: socket.id });
 
-      sendToClient(clientId, {
-        type: 'roomCreated',
-        code: roomCode,
-        playerId: clientId,
-        playerName: client.name,
+    const bothMoved = room.players.length === 2 && room.players.every(id => room.moves[id]);
+
+    if (bothMoved) {
+      const [p1, p2] = room.players;
+      const move1 = room.moves[p1];
+      const move2 = room.moves[p2];
+
+      let result = 'tie';
+      if (move1 !== move2) {
+        const rules = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
+        result = rules[move1] === move2 ? 'p1' : 'p2';
+      }
+
+      if (result === 'p1') room.scores[p1]++;
+      else if (result === 'p2') room.scores[p2]++;
+      room.round++;
+
+      io.to(player.room).emit('roundResult', {
+        moves: { [p1]: move1, [p2]: move2 },
+        result,
+        scores: room.scores,
+        round: room.round,
       });
-      break;
-    }
-
-    case 'joinRoom': {
-      const room = rooms.get(data.code);
-      if (!room) {
-        sendToClient(clientId, { type: 'error', message: 'Room not found' });
-        return;
-      }
-      if (room.players.length >= 2) {
-        sendToClient(clientId, { type: 'error', message: 'Room is full' });
-        return;
-      }
-
-      room.players.push(clientId);
-      room.scores[clientId] = 0;
-      client.room = data.code;
-      client.name = data.name || 'Player 2';
-
-      broadcastToRoom(data.code, {
-        type: 'playerJoined',
-        players: room.players.map(id => ({
-          id,
-          name: clients.get(id)?.name || 'Player',
-        })),
-        playerId: clientId,
-        playerName: client.name,
-      });
-      break;
-    }
-
-    case 'makeMove': {
-      const room = rooms.get(client.room);
-      if (!room) return;
-
-      room.moves[clientId] = data.move;
-
-      broadcastToRoom(client.room, {
-        type: 'playerMoved',
-        playerId: clientId,
-      }, clientId);
-
-      const bothMoved = room.players.length === 2 && room.players.every(id => room.moves[id]);
-
-      if (bothMoved) {
-        const [p1, p2] = room.players;
-        const move1 = room.moves[p1];
-        const move2 = room.moves[p2];
-
-        let result = 'tie';
-        if (move1 !== move2) {
-          const rules = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
-          result = rules[move1] === move2 ? 'p1' : 'p2';
-        }
-
-        if (result === 'p1') room.scores[p1]++;
-        else if (result === 'p2') room.scores[p2]++;
-        room.round++;
-
-        broadcastToRoom(client.room, {
-          type: 'roundResult',
-          moves: { [p1]: move1, [p2]: move2 },
-          result,
-          scores: room.scores,
-          round: room.round,
-        });
-
-        room.moves = {};
-      }
-      break;
-    }
-
-    case 'resetGame': {
-      const room = rooms.get(client.room);
-      if (!room) return;
 
       room.moves = {};
-      room.round = 0;
-      room.players.forEach(id => {
-        room.scores[id] = 0;
-      });
-
-      broadcastToRoom(client.room, {
-        type: 'gameReset',
-        scores: room.scores,
-      });
-      break;
     }
+  });
 
-    case 'leaveRoom': {
-      handleDisconnect(clientId);
-      break;
-    }
-  }
-}
+  socket.on('resetGame', () => {
+    const player = players.get(socket.id);
+    if (!player || !player.room) return;
 
-function handleDisconnect(clientId) {
-  const client = clients.get(clientId);
-  if (!client) return;
+    const room = rooms.get(player.room);
+    if (!room) return;
 
-  if (client.room) {
-    const room = rooms.get(client.room);
+    room.moves = {};
+    room.round = 0;
+    room.players.forEach(id => {
+      room.scores[id] = 0;
+    });
+
+    io.to(player.room).emit('gameReset', { scores: room.scores });
+  });
+
+  socket.on('leaveRoom', () => {
+    handleLeave(socket.id);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Player disconnected:', socket.id);
+    handleLeave(socket.id);
+  });
+});
+
+function handleLeave(socketId) {
+  const player = players.get(socketId);
+  if (!player) return;
+
+  if (player.room) {
+    const room = rooms.get(player.room);
     if (room) {
-      broadcastToRoom(client.room, {
-        type: 'playerLeft',
-        playerId: clientId,
-      }, clientId);
+      io.to(player.room).emit('playerLeft', { playerId: socketId });
 
-      room.players = room.players.filter(id => id !== clientId);
+      room.players = room.players.filter(id => id !== socketId);
       if (room.players.length === 0) {
-        rooms.delete(client.room);
+        rooms.delete(player.room);
       }
     }
   }
 
-  clients.delete(clientId);
+  players.delete(socketId);
 }
 
 app.get('/', (req, res) => {
