@@ -72,11 +72,13 @@ io.on('connection', (socket) => {
 
     socket.join(data.code);
 
+    const playerList = room.players.map(id => ({
+      id,
+      name: players.get(id)?.name || 'Player',
+    }));
+
     io.to(data.code).emit('playerJoined', {
-      players: room.players.map(id => ({
-        id,
-        name: players.get(id)?.name || 'Player',
-      })),
+      players: playerList,
       playerId: socket.id,
       playerName: data.name,
     });
