@@ -39,6 +39,7 @@ io.on('connection', (socket) => {
       players: [socket.id],
       moves: {},
       scores: { [socket.id]: 0 },
+      ties: { [socket.id]: 0 },
       round: 0,
     };
     rooms.set(roomCode, room);
@@ -67,6 +68,7 @@ io.on('connection', (socket) => {
 
     room.players.push(socket.id);
     room.scores[socket.id] = 0;
+    room.ties[socket.id] = 0;
     players.get(socket.id).room = data.code;
     players.get(socket.id).name = data.name || 'Player 2';
 
@@ -110,17 +112,39 @@ io.on('connection', (socket) => {
 
       if (result === 'p1') room.scores[p1]++;
       else if (result === 'p2') room.scores[p2]++;
+      else {
+        room.ties[p1] = (room.ties[p1] || 0) + 1;
+        room.ties[p2] = (room.ties[p2] || 0) + 1;
+      }
       room.round++;
 
       io.to(player.room).emit('roundResult', {
         moves: { [p1]: move1, [p2]: move2 },
         result,
         scores: room.scores,
+        ties: room.ties,
         round: room.round,
       });
 
       room.moves = {};
     }
+  });
+
+  socket.on('sendMessage', (data) => {
+    const player = players.get(socket.id);
+    if (!player || !player.room) return;
+
+    const room = rooms.get(player.room);
+    if (!room) return;
+
+    const message = {
+      playerId: socket.id,
+      playerName: player.name,
+      text: data.text,
+      timestamp: Date.now(),
+    };
+
+    io.to(player.room).emit('newMessage', message);
   });
 
   socket.on('resetGame', () => {
@@ -134,9 +158,13 @@ io.on('connection', (socket) => {
     room.round = 0;
     room.players.forEach(id => {
       room.scores[id] = 0;
+      room.ties[id] = 0;
     });
 
-    io.to(player.room).emit('gameReset', { scores: room.scores });
+    io.to(player.room).emit('gameReset', {
+      scores: room.scores,
+      ties: room.ties,
+    });
   });
 
   socket.on('leaveRoom', () => {
