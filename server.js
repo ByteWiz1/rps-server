@@ -70,32 +70,39 @@ io.on('connection', (socket) => {
   });
 
   socket.on('joinRoom', (data) => {
-    const room = rooms.get(data.code);
-    if (!room) {
-      socket.emit('error', { message: 'Room not found' });
-      return;
-    }
-    if (room.players.length >= 2) {
-      socket.emit('error', { message: 'Room is full' });
-      return;
-    }
+  const room = rooms.get(data.code);
+  if (!room) {
+    socket.emit('error', { message: 'Room not found' });
+    return;
+  }
+  if (room.players.length >= 2) {
+    socket.emit('error', { message: 'Room is full' });
+    return;
+  }
 
-    room.players.push(socket.id);
-    room.scores[socket.id] = 0;
-    room.ties[socket.id] = 0;
-    players.get(socket.id).room = data.code;
-    players.get(socket.id).name = data.name || 'Player 2';
+  room.players.push(socket.id);
+  room.scores[socket.id] = 0;
+  room.ties[socket.id] = 0;
+  players.get(socket.id).room = data.code;
+  players.get(socket.id).name = data.name || 'Player 2';
 
-    socket.join(data.code);
+  socket.join(data.code);
 
-    const playerList = getRoomPlayers(room);
+  const playerList = getRoomPlayers(room);
 
-    io.to(data.code).emit('playerJoined', {
-      players: playerList,
-      playerId: socket.id,
-      playerName: data.name,
-    });
+  // Notify the host that someone joined
+  io.to(data.code).emit('playerJoined', {
+    players: playerList,
+    playerId: socket.id,
+    playerName: data.name,
   });
+
+  // Send full room state to the joiner
+  socket.emit('roomState', {
+    players: playerList,
+    playerId: socket.id,
+  });
+});
 
   socket.on('makeMove', (data) => {
     const player = players.get(socket.id);
