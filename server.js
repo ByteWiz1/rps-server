@@ -36,6 +36,30 @@ function getRoomPlayers(room) {
   }));
 }
 
+function resetRoomScores(room) {
+  room.players.forEach((id) => {
+    room.scores[id] = 0;
+    room.ties[id] = 0;
+  });
+  room.moves = {};
+  room.round = 0;
+  room.matchOver = false;
+  room.winner = null;
+}
+
+function broadcastRoomState(room) {
+  const playerList = getRoomPlayers(room);
+  io.to(room.code).emit('roomState', {
+    players: playerList,
+    scores: room.scores,
+    ties: room.ties,
+    round: room.round,
+    matchOver: room.matchOver,
+    winner: room.winner,
+    winTarget: WIN_TARGET,
+  });
+}
+
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
   players.set(socket.id, { room: null, name: 'Player', disconnected: false });
@@ -70,39 +94,49 @@ io.on('connection', (socket) => {
   });
 
   socket.on('joinRoom', (data) => {
-  const room = rooms.get(data.code);
-  if (!room) {
-    socket.emit('error', { message: 'Room not found' });
-    return;
-  }
-  if (room.players.length >= 2) {
-    socket.emit('error', { message: 'Room is full' });
-    return;
-  }
+    const room = rooms.get(data.code);
+    if (!room) {
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
+    if (room.players.length >= 2) {
+      socket.emit('error', { message: 'Room is full' });
+      return;
+    }
 
-  room.players.push(socket.id);
-  room.scores[socket.id] = 0;
-  room.ties[socket.id] = 0;
-  players.get(socket.id).room = data.code;
-  players.get(socket.id).name = data.name || 'Player 2';
+    // Someone joining → clear any disconnect timer
+    if (room.disconnectTimer) {
+      clearTimeout(room.disconnectTimer);
+      room.disconnectTimer = null;
+    }
+    room.disconnectedPlayer = null;
 
-  socket.join(data.code);
+    room.players.push(socket.id);
+    room.scores[socket.id] = 0;
+    room.ties[socket.id] = 0;
+    players.get(socket.id).room = data.code;
+    players.get(socket.id).name = data.name || 'Player 2';
 
-  const playerList = getRoomPlayers(room);
+    socket.join(data.code);
 
-  // Notify the host that someone joined
-  io.to(data.code).emit('playerJoined', {
-    players: playerList,
-    playerId: socket.id,
-    playerName: data.name,
+    // Reset room scores when a new player joins
+    resetRoomScores(room);
+
+    // Broadcast room state to everyone in the room
+    broadcastRoomState(room);
+
+    // Also emit playerJoined for compatibility
+    io.to(data.code).emit('playerJoined', {
+      players: getRoomPlayers(room),
+      playerId: socket.id,
+      playerName: data.name,
+    });
+
+    io.to(data.code).emit('gameReset', {
+      scores: room.scores,
+      ties: room.ties,
+    });
   });
-
-  // Send full room state to the joiner
-  socket.emit('roomState', {
-    players: playerList,
-    playerId: socket.id,
-  });
-});
 
   socket.on('makeMove', (data) => {
     const player = players.get(socket.id);
@@ -189,41 +223,14 @@ io.on('connection', (socket) => {
     const room = rooms.get(player.room);
     if (!room) return;
 
-    room.moves = {};
-    room.round = 0;
-    room.matchOver = false;
-    room.winner = null;
-    room.players.forEach((id) => {
-      room.scores[id] = 0;
-      room.ties[id] = 0;
-    });
+    resetRoomScores(room);
 
     io.to(player.room).emit('gameReset', {
       scores: room.scores,
       ties: room.ties,
     });
-  });
 
-  socket.on('resetGame', () => {
-    const player = players.get(socket.id);
-    if (!player || !player.room) return;
-
-    const room = rooms.get(player.room);
-    if (!room) return;
-
-    room.moves = {};
-    room.round = 0;
-    room.matchOver = false;
-    room.winner = null;
-    room.players.forEach((id) => {
-      room.scores[id] = 0;
-      room.ties[id] = 0;
-    });
-
-    io.to(player.room).emit('gameReset', {
-      scores: room.scores,
-      ties: room.ties,
-    });
+    broadcastRoomState(room);
   });
 
   socket.on('leaveRoom', () => {
@@ -318,7 +325,6 @@ function handleLeave(socketId, notify = false) {
   }
 
   players.delete(socketId);
-  socket && players.delete(socketId);
 }
 
 app.get('/', (req, res) => {
