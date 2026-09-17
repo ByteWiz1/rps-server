@@ -17,6 +17,9 @@ const io = new Server(server, {
 const rooms = new Map();
 const players = new Map();
 
+const WIN_TARGET = 30;
+const DISCONNECT_TIMEOUT = 20000;
+
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -26,9 +29,16 @@ function generateRoomCode() {
   return code;
 }
 
+function getRoomPlayers(room) {
+  return room.players.map((id) => ({
+    id,
+    name: players.get(id)?.name || 'Player',
+  }));
+}
+
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
-  players.set(socket.id, { room: null, name: 'Player' });
+  players.set(socket.id, { room: null, name: 'Player', disconnected: false });
 
   socket.emit('connected', { playerId: socket.id });
 
@@ -41,6 +51,10 @@ io.on('connection', (socket) => {
       scores: { [socket.id]: 0 },
       ties: { [socket.id]: 0 },
       round: 0,
+      matchOver: false,
+      winner: null,
+      disconnectTimer: null,
+      disconnectedPlayer: null,
     };
     rooms.set(roomCode, room);
     players.get(socket.id).room = roomCode;
@@ -74,10 +88,7 @@ io.on('connection', (socket) => {
 
     socket.join(data.code);
 
-    const playerList = room.players.map(id => ({
-      id,
-      name: players.get(id)?.name || 'Player',
-    }));
+    const playerList = getRoomPlayers(room);
 
     io.to(data.code).emit('playerJoined', {
       players: playerList,
@@ -92,12 +103,14 @@ io.on('connection', (socket) => {
 
     const room = rooms.get(player.room);
     if (!room) return;
+    if (room.matchOver) return;
 
     room.moves[socket.id] = data.move;
 
     socket.to(player.room).emit('playerMoved', { playerId: socket.id });
 
-    const bothMoved = room.players.length === 2 && room.players.every(id => room.moves[id]);
+    const bothMoved =
+      room.players.length === 2 && room.players.every((id) => room.moves[id]);
 
     if (bothMoved) {
       const [p1, p2] = room.players;
@@ -118,12 +131,27 @@ io.on('connection', (socket) => {
       }
       room.round++;
 
+      const p1Score = room.scores[p1];
+      const p2Score = room.scores[p2];
+
+      let matchWinner = null;
+      if (p1Score >= WIN_TARGET) matchWinner = p1;
+      else if (p2Score >= WIN_TARGET) matchWinner = p2;
+
+      if (matchWinner) {
+        room.matchOver = true;
+        room.winner = matchWinner;
+      }
+
       io.to(player.room).emit('roundResult', {
         moves: { [p1]: move1, [p2]: move2 },
         result,
         scores: room.scores,
         ties: room.ties,
         round: room.round,
+        matchOver: room.matchOver,
+        matchWinner: matchWinner,
+        winTarget: WIN_TARGET,
       });
 
       room.moves = {};
@@ -147,6 +175,28 @@ io.on('connection', (socket) => {
     io.to(player.room).emit('newMessage', message);
   });
 
+  socket.on('playAgain', () => {
+    const player = players.get(socket.id);
+    if (!player || !player.room) return;
+
+    const room = rooms.get(player.room);
+    if (!room) return;
+
+    room.moves = {};
+    room.round = 0;
+    room.matchOver = false;
+    room.winner = null;
+    room.players.forEach((id) => {
+      room.scores[id] = 0;
+      room.ties[id] = 0;
+    });
+
+    io.to(player.room).emit('gameReset', {
+      scores: room.scores,
+      ties: room.ties,
+    });
+  });
+
   socket.on('resetGame', () => {
     const player = players.get(socket.id);
     if (!player || !player.room) return;
@@ -156,7 +206,9 @@ io.on('connection', (socket) => {
 
     room.moves = {};
     room.round = 0;
-    room.players.forEach(id => {
+    room.matchOver = false;
+    room.winner = null;
+    room.players.forEach((id) => {
       room.scores[id] = 0;
       room.ties[id] = 0;
     });
@@ -168,32 +220,98 @@ io.on('connection', (socket) => {
   });
 
   socket.on('leaveRoom', () => {
-    handleLeave(socket.id);
+    handleLeave(socket.id, true);
   });
 
   socket.on('disconnect', () => {
     console.log('Player disconnected:', socket.id);
-    handleLeave(socket.id);
+    handleDisconnect(socket.id);
   });
 });
 
-function handleLeave(socketId) {
+function handleDisconnect(socketId) {
+  const player = players.get(socketId);
+  if (!player) return;
+
+  if (!player.room) {
+    players.delete(socketId);
+    return;
+  }
+
+  const room = rooms.get(player.room);
+  if (!room) {
+    players.delete(socketId);
+    return;
+  }
+
+  if (room.matchOver) {
+    io.to(player.room).emit('playerLeft', { playerId: socketId });
+    room.players = room.players.filter((id) => id !== socketId);
+    if (room.players.length === 0) rooms.delete(player.room);
+    players.delete(socketId);
+    return;
+  }
+
+  room.disconnectedPlayer = socketId;
+  const opponentId = room.players.find((id) => id !== socketId);
+
+  if (opponentId) {
+    io.to(opponentId).emit('opponentDisconnected', {
+      playerId: socketId,
+      timeout: DISCONNECT_TIMEOUT,
+    });
+  }
+
+  if (room.disconnectTimer) clearTimeout(room.disconnectTimer);
+
+  room.disconnectTimer = setTimeout(() => {
+    if (!room.disconnectedPlayer) return;
+
+    const disconnectedId = room.disconnectedPlayer;
+    const winnerId = room.players.find((id) => id !== disconnectedId);
+
+    if (winnerId) {
+      room.matchOver = true;
+      room.winner = winnerId;
+
+      io.to(winnerId).emit('opponentTimedOut', {
+        winnerId: winnerId,
+        loserId: disconnectedId,
+      });
+    }
+
+    room.players = room.players.filter((id) => id !== disconnectedId);
+    if (room.players.length === 0) rooms.delete(room.code);
+    players.delete(disconnectedId);
+    room.disconnectedPlayer = null;
+    room.disconnectTimer = null;
+  }, DISCONNECT_TIMEOUT);
+}
+
+function handleLeave(socketId, notify = false) {
   const player = players.get(socketId);
   if (!player) return;
 
   if (player.room) {
     const room = rooms.get(player.room);
     if (room) {
-      io.to(player.room).emit('playerLeft', { playerId: socketId });
-
-      room.players = room.players.filter(id => id !== socketId);
-      if (room.players.length === 0) {
-        rooms.delete(player.room);
+      if (room.disconnectTimer) {
+        clearTimeout(room.disconnectTimer);
+        room.disconnectTimer = null;
       }
+      room.disconnectedPlayer = null;
+
+      if (notify) {
+        io.to(player.room).emit('playerLeft', { playerId: socketId });
+      }
+
+      room.players = room.players.filter((id) => id !== socketId);
+      if (room.players.length === 0) rooms.delete(player.room);
     }
   }
 
   players.delete(socketId);
+  socket && players.delete(socketId);
 }
 
 app.get('/', (req, res) => {
