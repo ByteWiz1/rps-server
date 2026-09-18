@@ -324,48 +324,62 @@ io.on('connection', (socket) => {
   });
 
   socket.on('createRoom', (data) => {
-    let roomCode;
+  let roomCode;
 
-    if (data.customCode && data.customCode.length === 4) {
-      roomCode = data.customCode.toUpperCase();
-      if (rooms.has(roomCode)) {
-        socket.emit('error', { message: 'Code already in use. Try another.' });
-        return;
-      }
-    } else {
-      roomCode = generateRoomCode();
+  if (data.customCode && data.customCode.length === 4) {
+    roomCode = data.customCode.toUpperCase();
+    if (rooms.has(roomCode)) {
+      socket.emit('error', { message: 'Code already in use. Try another.' });
+      return;
     }
+  } else {
+    roomCode = generateRoomCode();
+  }
 
-    const room = {
-      code: roomCode,
-      players: [socket.id],
-      moves: {},
-      scores: { [socket.id]: 0 },
-      ties: { [socket.id]: 0 },
-      round: 0,
-      matchOver: false,
-      winner: null,
-      disconnectTimer: null,
-      disconnectedPlayer: null,
-    };
-    rooms.set(roomCode, room);
+  const room = {
+    code: roomCode,
+    players: [socket.id],
+    moves: {},
+    scores: { [socket.id]: 0 },
+    ties: { [socket.id]: 0 },
+    round: 0,
+    matchOver: false,
+    winner: null,
+    disconnectTimer: null,
+    disconnectedPlayer: null,
+  };
+  rooms.set(roomCode, room);
 
-    const player = players.get(socket.id);
-    if (player) {
-      player.room = roomCode;
-      if (data.name) player.name = data.name;
-    }
+  const player = players.get(socket.id);
+  if (player) {
+    player.room = roomCode;
+    if (data.name) player.name = data.name;
+  }
 
-    socket.join(roomCode);
+  socket.join(roomCode);
 
-    socket.emit('roomCreated', {
-      code: roomCode,
-      playerId: socket.id,
-      playerName: player?.name || 'Player 1',
-    });
-
-    console.log('[CREATE ROOM]', socket.id, '→', roomCode);
+  socket.emit('roomCreated', {
+    code: roomCode,
+    playerId: socket.id,
+    playerName: player?.name || 'Player 1',
   });
+
+  console.log('[CREATE ROOM]', socket.id, '→', roomCode);
+});
+
+socket.on('getHostCode', () => {
+  const player = players.get(socket.id);
+  if (!player || !player.room) {
+    socket.emit('hostCode', { code: null });
+    return;
+  }
+  const room = rooms.get(player.room);
+  if (!room) {
+    socket.emit('hostCode', { code: null });
+    return;
+  }
+  socket.emit('hostCode', { code: room.code });
+});
 
   socket.on('joinRoom', (data) => {
     const code = (data.code || '').toUpperCase();
