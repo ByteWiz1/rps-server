@@ -236,80 +236,95 @@ io.on('connection', (socket) => {
   });
 
   socket.on('respondToInvite', (data) => {
-    const invite = activeInvites.get(data.inviteId);
-    if (!invite) {
-      socket.emit('inviteError', { message: 'Invite expired or not found' });
-      return;
+  const invite = activeInvites.get(data.inviteId);
+  if (!invite) {
+    socket.emit('inviteError', { message: 'Invite expired or not found' });
+    return;
+  }
+  if (invite.toId !== socket.id) {
+    socket.emit('inviteError', { message: 'Invalid invite' });
+    return;
+  }
+
+  if (invite.timeout) clearTimeout(invite.timeout);
+
+  if (data.accepted) {
+    invite.status = 'accepted';
+
+    const roomCode = generateRoomCode();
+    const room = {
+      code: roomCode,
+      players: [invite.fromId, invite.toId],
+      moves: {},
+      scores: { [invite.fromId]: 0, [invite.toId]: 0 },
+      ties: { [invite.fromId]: 0, [invite.toId]: 0 },
+      round: 0,
+      matchOver: false,
+      winner: null,
+      disconnectTimer: null,
+      disconnectedPlayer: null,
+    };
+    rooms.set(roomCode, room);
+
+    const fromPlayerData = players.get(invite.fromId);
+    const toPlayerData = players.get(invite.toId);
+    if (fromPlayerData) fromPlayerData.room = roomCode;
+    if (toPlayerData) toPlayerData.room = roomCode;
+
+    if (onlinePlayers.has(invite.fromId)) {
+      onlinePlayers.get(invite.fromId).status = 'in-match';
     }
-    if (invite.toId !== socket.id) {
-      socket.emit('inviteError', { message: 'Invalid invite' });
-      return;
-    }
-
-    if (invite.timeout) clearTimeout(invite.timeout);
-
-    if (data.accepted) {
-      invite.status = 'accepted';
-
-      const roomCode = generateRoomCode();
-      const room = {
-        code: roomCode,
-        players: [invite.fromId, invite.toId],
-        moves: {},
-        scores: { [invite.fromId]: 0, [invite.toId]: 0 },
-        ties: { [invite.fromId]: 0, [invite.toId]: 0 },
-        round: 0,
-        matchOver: false,
-        winner: null,
-        disconnectTimer: null,
-        disconnectedPlayer: null,
-      };
-      rooms.set(roomCode, room);
-
-      const fromPlayerData = players.get(invite.fromId);
-      const toPlayerData = players.get(invite.toId);
-      if (fromPlayerData) fromPlayerData.room = roomCode;
-      if (toPlayerData) toPlayerData.room = roomCode;
-
-      if (onlinePlayers.has(invite.fromId)) {
-        onlinePlayers.get(invite.fromId).status = 'in-match';
-      }
-      if (onlinePlayers.has(invite.toId)) {
-        onlinePlayers.get(invite.toId).status = 'in-match';
-      }
-
-      const fromSocket = io.sockets.sockets.get(invite.fromId);
-      const toSocket = io.sockets.sockets.get(invite.toId);
-      if (fromSocket) fromSocket.join(roomCode);
-      if (toSocket) toSocket.join(roomCode);
-
-      io.to(invite.fromId).emit('inviteAccepted', {
-        roomCode,
-        playerId: invite.fromId,
-        playerName: fromPlayerData?.name || 'Player',
-        opponentName: toPlayerData?.name || 'Player',
-        opponentId: invite.toId,
-      });
-
-      io.to(invite.toId).emit('inviteAccepted', {
-        roomCode,
-        playerId: invite.toId,
-        playerName: toPlayerData?.name || 'Player',
-        opponentName: fromPlayerData?.name || 'Player',
-        opponentId: invite.fromId,
-      });
-
-      recordRecentOpponent(invite.fromId, invite.toId);
-      recordRecentOpponent(invite.toId, invite.fromId);
-
-      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode);
-    } else {
-      invite.status = 'declined';
-      io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
+    if (onlinePlayers.has(invite.toId)) {
+      onlinePlayers.get(invite.toId).status = 'in-match';
     }
 
-    activeInvites.delete(invite.id);
-  });
+    const fromSocket = io.sockets.sockets.get(invite.fromId);
+    const toSocket = io.sockets.sockets.get(invite.toId);
+    if (fromSocket) fromSocket.join(roomCode);
+    if (toSocket) toSocket.join(roomCode);
+
+    const playerList = getRoomPlayers(room);
+
+    io.to(invite.fromId).emit('inviteAccepted', {
+      roomCode,
+      playerId: invite.fromId,
+      playerName: fromPlayerData?.name || 'Player',
+      opponentName: toPlayerData?.name || 'Player',
+      opponentId: invite.toId,
+      players: playerList,
+    });
+
+    io.to(invite.toId).emit('inviteAccepted', {
+      roomCode,
+      playerId: invite.toId,
+      playerName: toPlayerData?.name || 'Player',
+      opponentName: fromPlayerData?.name || 'Player',
+      opponentId: invite.fromId,
+      players: playerList,
+    });
+
+    // Also broadcast the room state so both clients have full data
+    io.to(roomCode).emit('roomState', {
+      players: playerList,
+      scores: room.scores,
+      ties: room.ties,
+      round: room.round,
+      matchOver: room.matchOver,
+      winner: room.winner,
+      winTarget: WIN_TARGET,
+    });
+
+    recordRecentOpponent(invite.fromId, invite.toId);
+    recordRecentOpponent(invite.toId, invite.fromId);
+
+    console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode);
+  } else {
+    invite.status = 'declined';
+    io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
+  }
+
+  activeInvites.delete(invite.id);
+});
 
   socket.on('getRecentOpponents', () => {
     const list = recentOpponents.get(socket.id) || [];
