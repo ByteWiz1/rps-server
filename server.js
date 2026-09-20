@@ -38,9 +38,7 @@ function isUsernameAvailable(name) {
   const normalized = normalizeUsername(name);
   if (!normalized) return false;
   for (const [, player] of onlinePlayers) {
-    if (player.username === normalized) {
-      return false;
-    }
+    if (player.username === normalized) return false;
   }
   return true;
 }
@@ -90,6 +88,25 @@ function broadcastRoomState(room) {
   });
 }
 
+function broadcastOnlineUsers() {
+  const users = [];
+  for (const [socketId, player] of onlinePlayers) {
+    users.push({
+      userId: player.userId,
+      name: player.name,
+      username: player.username,
+      avatar: player.avatar,
+      status: player.status,
+      socketId,
+    });
+  }
+  io.emit('onlineUsers', { users });
+}
+
+function broadcastOnlineCount() {
+  io.emit('onlineCount', { count: onlinePlayers.size });
+}
+
 function recordRecentOpponent(playerId, opponentId) {
   if (!playerId || !opponentId) return;
   const list = recentOpponents.get(playerId) || [];
@@ -105,16 +122,62 @@ function recordRecentOpponent(playerId, opponentId) {
   recentOpponents.set(playerId, filtered.slice(0, 5));
 }
 
-function broadcastOnlineCount() {
-  io.emit('onlineCount', { count: onlinePlayers.size });
-}
-
 io.on('connection', (socket) => {
   console.log('[CONNECT]', socket.id);
-  players.set(socket.id, { room: null, name: 'Player', username: null });
+  players.set(socket.id, { room: null, name: 'Player', username: null, userId: null });
 
   socket.emit('connected', { playerId: socket.id });
 
+  // ============================================
+  // IDENTITY (persistent across sessions)
+  // ============================================
+  socket.on('registerIdentity', (data) => {
+    const userId = (data.userId || '').trim();
+    const username = (data.username || '').trim().slice(0, 15);
+    const avatar = data.avatar || '🤖';
+
+    if (!userId || username.length < 3) {
+      socket.emit('identityError', { message: 'Invalid identity data' });
+      return;
+    }
+
+    // Remove any stale sockets for this user
+    for (const [existingSocketId, existingPlayer] of onlinePlayers) {
+      if (existingPlayer.userId === userId && existingSocketId !== socket.id) {
+        onlinePlayers.delete(existingSocketId);
+        const oldPlayer = players.get(existingSocketId);
+        if (oldPlayer) oldPlayer.userId = null;
+      }
+    }
+
+    // Update player record
+    const player = players.get(socket.id);
+    if (player) {
+      player.name = username;
+      player.username = normalizeUsername(username);
+      player.userId = userId;
+    }
+
+    // Register in online players
+    onlinePlayers.set(socket.id, {
+      userId,
+      name: username,
+      username: normalizeUsername(username),
+      avatar,
+      status: 'online',
+      socketId: socket.id,
+      connectedAt: Date.now(),
+    });
+
+    broadcastOnlineUsers();
+    broadcastOnlineCount();
+
+    console.log('[IDENTITY]', socket.id, '→', username, `(${userId})`);
+  });
+
+  // ============================================
+  // USERNAME REGISTRATION (legacy — used by lobby)
+  // ============================================
   socket.on('registerUsername', (data) => {
     const requestedName = (data.name || '').trim().slice(0, 15);
 
@@ -133,22 +196,47 @@ io.on('connection', (socket) => {
     player.name = finalName;
     player.username = normalizeUsername(finalName);
 
+    // Update online players (preserving userId if exists)
+    const existing = onlinePlayers.get(socket.id);
     onlinePlayers.set(socket.id, {
+      userId: existing?.userId || null,
       name: finalName,
       username: normalizeUsername(finalName),
+      avatar: existing?.avatar || '🤖',
       status: 'online',
       socketId: socket.id,
+      connectedAt: existing?.connectedAt || Date.now(),
     });
 
-    console.log('[REGISTER]', socket.id, '→', finalName, '(normalized:', player.username + ')');
-
+    console.log('[REGISTER]', socket.id, '→', finalName);
     socket.emit('usernameRegistered', { name: finalName });
+    broadcastOnlineUsers();
     broadcastOnlineCount();
   });
 
+  // ============================================
+  // ONLINE USERS LIST (request current list)
+  // ============================================
+  socket.on('getOnlineUsers', () => {
+    const users = [];
+    for (const [socketId, player] of onlinePlayers) {
+      users.push({
+        userId: player.userId,
+        name: player.name,
+        username: player.username,
+        avatar: player.avatar,
+        status: player.status,
+        socketId,
+      });
+    }
+    socket.emit('onlineUsers', { users });
+  });
+
+  // ============================================
+  // SEARCH PLAYER
+  // ============================================
   socket.on('searchPlayer', (data) => {
     const target = normalizeUsername(data.username || '');
-    console.log('[SEARCH]', socket.id, 'searching for:', target);
 
     if (!target) {
       socket.emit('searchResult', { found: false, message: 'Enter a username' });
@@ -165,7 +253,6 @@ io.on('connection', (socket) => {
     }
 
     if (found) {
-      console.log('[SEARCH] Found:', found.name, 'status:', found.status);
       socket.emit('searchResult', {
         found: true,
         player: {
@@ -175,9 +262,6 @@ io.on('connection', (socket) => {
         },
       });
     } else {
-      console.log('[SEARCH] Not found. Online count:', onlinePlayers.size);
-      const onlineNames = Array.from(onlinePlayers.values()).map((p) => p.username);
-      console.log('[SEARCH] Online usernames:', onlineNames);
       socket.emit('searchResult', {
         found: false,
         message: 'Player not found or offline',
@@ -185,6 +269,9 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ============================================
+  // INVITES
+  // ============================================
   socket.on('sendInvite', (data) => {
     const fromPlayer = players.get(socket.id);
     if (!fromPlayer) return;
@@ -236,95 +323,95 @@ io.on('connection', (socket) => {
   });
 
   socket.on('respondToInvite', (data) => {
-  const invite = activeInvites.get(data.inviteId);
-  if (!invite) {
-    socket.emit('inviteError', { message: 'Invite expired or not found' });
-    return;
-  }
-  if (invite.toId !== socket.id) {
-    socket.emit('inviteError', { message: 'Invalid invite' });
-    return;
-  }
-
-  if (invite.timeout) clearTimeout(invite.timeout);
-
-  if (data.accepted) {
-    invite.status = 'accepted';
-
-    const roomCode = generateRoomCode();
-    const room = {
-      code: roomCode,
-      players: [invite.fromId, invite.toId],
-      moves: {},
-      scores: { [invite.fromId]: 0, [invite.toId]: 0 },
-      ties: { [invite.fromId]: 0, [invite.toId]: 0 },
-      round: 0,
-      matchOver: false,
-      winner: null,
-      disconnectTimer: null,
-      disconnectedPlayer: null,
-    };
-    rooms.set(roomCode, room);
-
-    const fromPlayerData = players.get(invite.fromId);
-    const toPlayerData = players.get(invite.toId);
-    if (fromPlayerData) fromPlayerData.room = roomCode;
-    if (toPlayerData) toPlayerData.room = roomCode;
-
-    if (onlinePlayers.has(invite.fromId)) {
-      onlinePlayers.get(invite.fromId).status = 'in-match';
+    const invite = activeInvites.get(data.inviteId);
+    if (!invite) {
+      socket.emit('inviteError', { message: 'Invite expired or not found' });
+      return;
     }
-    if (onlinePlayers.has(invite.toId)) {
-      onlinePlayers.get(invite.toId).status = 'in-match';
+    if (invite.toId !== socket.id) {
+      socket.emit('inviteError', { message: 'Invalid invite' });
+      return;
     }
 
-    const fromSocket = io.sockets.sockets.get(invite.fromId);
-    const toSocket = io.sockets.sockets.get(invite.toId);
-    if (fromSocket) fromSocket.join(roomCode);
-    if (toSocket) toSocket.join(roomCode);
+    if (invite.timeout) clearTimeout(invite.timeout);
 
-    const playerList = getRoomPlayers(room);
+    if (data.accepted) {
+      invite.status = 'accepted';
 
-    io.to(invite.fromId).emit('inviteAccepted', {
-      roomCode,
-      playerId: invite.fromId,
-      playerName: fromPlayerData?.name || 'Player',
-      opponentName: toPlayerData?.name || 'Player',
-      opponentId: invite.toId,
-      players: playerList,
-    });
+      const roomCode = generateRoomCode();
+      const room = {
+        code: roomCode,
+        players: [invite.fromId, invite.toId],
+        moves: {},
+        scores: { [invite.fromId]: 0, [invite.toId]: 0 },
+        ties: { [invite.fromId]: 0, [invite.toId]: 0 },
+        round: 0,
+        matchOver: false,
+        winner: null,
+        disconnectTimer: null,
+        disconnectedPlayer: null,
+      };
+      rooms.set(roomCode, room);
 
-    io.to(invite.toId).emit('inviteAccepted', {
-      roomCode,
-      playerId: invite.toId,
-      playerName: toPlayerData?.name || 'Player',
-      opponentName: fromPlayerData?.name || 'Player',
-      opponentId: invite.fromId,
-      players: playerList,
-    });
+      const fromPlayerData = players.get(invite.fromId);
+      const toPlayerData = players.get(invite.toId);
+      if (fromPlayerData) fromPlayerData.room = roomCode;
+      if (toPlayerData) toPlayerData.room = roomCode;
 
-    // Also broadcast the room state so both clients have full data
-    io.to(roomCode).emit('roomState', {
-      players: playerList,
-      scores: room.scores,
-      ties: room.ties,
-      round: room.round,
-      matchOver: room.matchOver,
-      winner: room.winner,
-      winTarget: WIN_TARGET,
-    });
+      if (onlinePlayers.has(invite.fromId)) {
+        onlinePlayers.get(invite.fromId).status = 'in-match';
+      }
+      if (onlinePlayers.has(invite.toId)) {
+        onlinePlayers.get(invite.toId).status = 'in-match';
+      }
 
-    recordRecentOpponent(invite.fromId, invite.toId);
-    recordRecentOpponent(invite.toId, invite.fromId);
+      const fromSocket = io.sockets.sockets.get(invite.fromId);
+      const toSocket = io.sockets.sockets.get(invite.toId);
+      if (fromSocket) fromSocket.join(roomCode);
+      if (toSocket) toSocket.join(roomCode);
 
-    console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode);
-  } else {
-    invite.status = 'declined';
-    io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
-  }
+      const playerList = getRoomPlayers(room);
 
-  activeInvites.delete(invite.id);
-});
+      io.to(invite.fromId).emit('inviteAccepted', {
+        roomCode,
+        playerId: invite.fromId,
+        playerName: fromPlayerData?.name || 'Player',
+        opponentName: toPlayerData?.name || 'Player',
+        opponentId: invite.toId,
+        players: playerList,
+      });
+
+      io.to(invite.toId).emit('inviteAccepted', {
+        roomCode,
+        playerId: invite.toId,
+        playerName: toPlayerData?.name || 'Player',
+        opponentName: fromPlayerData?.name || 'Player',
+        opponentId: invite.fromId,
+        players: playerList,
+      });
+
+      io.to(roomCode).emit('roomState', {
+        players: playerList,
+        scores: room.scores,
+        ties: room.ties,
+        round: room.round,
+        matchOver: room.matchOver,
+        winner: room.winner,
+        winTarget: WIN_TARGET,
+      });
+
+      recordRecentOpponent(invite.fromId, invite.toId);
+      recordRecentOpponent(invite.toId, invite.fromId);
+      broadcastOnlineUsers();
+
+      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode);
+    } else {
+      invite.status = 'declined';
+      io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
+    }
+
+    activeInvites.delete(invite.id);
+  });
 
   socket.on('getRecentOpponents', () => {
     const list = recentOpponents.get(socket.id) || [];
@@ -338,63 +425,66 @@ io.on('connection', (socket) => {
     socket.emit('recentOpponents', enriched);
   });
 
+  // ============================================
+  // ROOM MANAGEMENT
+  // ============================================
   socket.on('createRoom', (data) => {
-  let roomCode;
+    let roomCode;
 
-  if (data.customCode && data.customCode.length === 4) {
-    roomCode = data.customCode.toUpperCase();
-    if (rooms.has(roomCode)) {
-      socket.emit('error', { message: 'Code already in use. Try another.' });
-      return;
+    if (data.customCode && data.customCode.length === 4) {
+      roomCode = data.customCode.toUpperCase();
+      if (rooms.has(roomCode)) {
+        socket.emit('error', { message: 'Code already in use. Try another.' });
+        return;
+      }
+    } else {
+      roomCode = generateRoomCode();
     }
-  } else {
-    roomCode = generateRoomCode();
-  }
 
-  const room = {
-    code: roomCode,
-    players: [socket.id],
-    moves: {},
-    scores: { [socket.id]: 0 },
-    ties: { [socket.id]: 0 },
-    round: 0,
-    matchOver: false,
-    winner: null,
-    disconnectTimer: null,
-    disconnectedPlayer: null,
-  };
-  rooms.set(roomCode, room);
+    const room = {
+      code: roomCode,
+      players: [socket.id],
+      moves: {},
+      scores: { [socket.id]: 0 },
+      ties: { [socket.id]: 0 },
+      round: 0,
+      matchOver: false,
+      winner: null,
+      disconnectTimer: null,
+      disconnectedPlayer: null,
+    };
+    rooms.set(roomCode, room);
 
-  const player = players.get(socket.id);
-  if (player) {
-    player.room = roomCode;
-    if (data.name) player.name = data.name;
-  }
+    const player = players.get(socket.id);
+    if (player) {
+      player.room = roomCode;
+      if (data.name) player.name = data.name;
+    }
 
-  socket.join(roomCode);
+    socket.join(roomCode);
 
-  socket.emit('roomCreated', {
-    code: roomCode,
-    playerId: socket.id,
-    playerName: player?.name || 'Player 1',
+    socket.emit('roomCreated', {
+      code: roomCode,
+      playerId: socket.id,
+      playerName: player?.name || 'Player 1',
+    });
+
+    console.log('[CREATE ROOM]', socket.id, '→', roomCode);
   });
 
-  console.log('[CREATE ROOM]', socket.id, '→', roomCode);
-});
-
-socket.on('getHostCode', () => {
-  const player = players.get(socket.id);
-  if (!player || !player.room) {
-    socket.emit('hostCode', { code: null });
-    return;
-  }
-  const room = rooms.get(player.room);
-  if (!room) {
-    socket.emit('hostCode', { code: null });
-    return;
-  }
-  socket.emit('hostCode', { code: room.code });
-});
+  socket.on('getHostCode', () => {
+    const player = players.get(socket.id);
+    if (!player || !player.room) {
+      socket.emit('hostCode', { code: null });
+      return;
+    }
+    const room = rooms.get(player.room);
+    if (!room) {
+      socket.emit('hostCode', { code: null });
+      return;
+    }
+    socket.emit('hostCode', { code: room.code });
+  });
 
   socket.on('joinRoom', (data) => {
     const code = (data.code || '').toUpperCase();
@@ -444,6 +534,9 @@ socket.on('getHostCode', () => {
     console.log('[JOIN ROOM]', socket.id, '→', code);
   });
 
+  // ============================================
+  // GAMEPLAY
+  // ============================================
   socket.on('makeMove', (data) => {
     const player = players.get(socket.id);
     if (!player || !player.room) return;
@@ -551,6 +644,7 @@ function handleDisconnect(socketId) {
   if (!player) return;
 
   onlinePlayers.delete(socketId);
+  broadcastOnlineUsers();
   broadcastOnlineCount();
 
   if (!player.room) {
@@ -629,6 +723,7 @@ function handleLeave(socketId, notify = false) {
 
       if (onlinePlayers.has(socketId)) {
         onlinePlayers.get(socketId).status = 'online';
+        broadcastOnlineUsers();
       }
     }
   }
