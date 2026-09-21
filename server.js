@@ -20,6 +20,7 @@ const recentOpponents = new Map();
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
+const AVATAR_ROUND_DELAY = 1500;
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -122,15 +123,82 @@ function recordRecentOpponent(playerId, opponentId) {
   recentOpponents.set(playerId, filtered.slice(0, 5));
 }
 
+function resolveRound(room, move1, move2) {
+  let result = 'tie';
+  if (move1 !== move2) {
+    const rules = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
+    result = rules[move1] === move2 ? 'p1' : 'p2';
+  }
+  return result;
+}
+
+function startAvatarAutoPlay(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  if (room.avatarAutoTimer) clearTimeout(room.avatarAutoTimer);
+  if (room.matchOver) return;
+
+  const runRound = () => {
+    const r = rooms.get(roomCode);
+    if (!r) return;
+    if (r.matchOver) return;
+    if (r.players.length < 2) return;
+
+    const [p1, p2] = r.players;
+    const moves = ['rock', 'paper', 'scissors'];
+    const move1 = moves[Math.floor(Math.random() * moves.length)];
+    const move2 = moves[Math.floor(Math.random() * moves.length)];
+
+    io.to(roomCode).emit('playerMoved', { playerId: p1 });
+    io.to(roomCode).emit('playerMoved', { playerId: p2 });
+
+    const result = resolveRound(r, move1, move2);
+
+    if (result === 'p1') r.scores[p1]++;
+    else if (result === 'p2') r.scores[p2]++;
+    else {
+      r.ties[p1] = (r.ties[p1] || 0) + 1;
+      r.ties[p2] = (r.ties[p2] || 0) + 1;
+    }
+    r.round++;
+
+    let matchWinner = null;
+    if (r.scores[p1] >= WIN_TARGET) matchWinner = p1;
+    else if (r.scores[p2] >= WIN_TARGET) matchWinner = p2;
+
+    if (matchWinner) {
+      r.matchOver = true;
+      r.winner = matchWinner;
+    }
+
+    io.to(roomCode).emit('roundResult', {
+      moves: { [p1]: move1, [p2]: move2 },
+      result,
+      scores: r.scores,
+      ties: r.ties,
+      round: r.round,
+      matchOver: r.matchOver,
+      matchWinner,
+      winTarget: WIN_TARGET,
+    });
+
+    if (!r.matchOver) {
+      r.avatarAutoTimer = setTimeout(runRound, AVATAR_ROUND_DELAY);
+    } else {
+      r.avatarAutoTimer = null;
+    }
+  };
+
+  room.avatarAutoTimer = setTimeout(runRound, AVATAR_ROUND_DELAY);
+  console.log('[AVATAR AUTO] Started for room', roomCode);
+}
+
 io.on('connection', (socket) => {
   console.log('[CONNECT]', socket.id);
   players.set(socket.id, { room: null, name: 'Player', username: null, userId: null });
 
   socket.emit('connected', { playerId: socket.id });
 
-  // ============================================
-  // IDENTITY (persistent across sessions)
-  // ============================================
   socket.on('registerIdentity', (data) => {
     const userId = (data.userId || '').trim();
     const username = (data.username || '').trim().slice(0, 15);
@@ -141,7 +209,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Remove any stale sockets for this user
     for (const [existingSocketId, existingPlayer] of onlinePlayers) {
       if (existingPlayer.userId === userId && existingSocketId !== socket.id) {
         onlinePlayers.delete(existingSocketId);
@@ -150,7 +217,6 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Update player record
     const player = players.get(socket.id);
     if (player) {
       player.name = username;
@@ -158,7 +224,6 @@ io.on('connection', (socket) => {
       player.userId = userId;
     }
 
-    // Register in online players
     onlinePlayers.set(socket.id, {
       userId,
       name: username,
@@ -175,48 +240,6 @@ io.on('connection', (socket) => {
     console.log('[IDENTITY]', socket.id, '→', username, `(${userId})`);
   });
 
-  // ============================================
-  // USERNAME REGISTRATION (legacy — used by lobby)
-  // ============================================
-  socket.on('registerUsername', (data) => {
-    const requestedName = (data.name || '').trim().slice(0, 15);
-
-    if (requestedName.length < 3) {
-      socket.emit('usernameError', { message: 'Name must be at least 3 characters' });
-      return;
-    }
-
-    const finalName = isUsernameAvailable(requestedName)
-      ? requestedName
-      : generateUniqueUsername(requestedName);
-
-    const player = players.get(socket.id);
-    if (!player) return;
-
-    player.name = finalName;
-    player.username = normalizeUsername(finalName);
-
-    // Update online players (preserving userId if exists)
-    const existing = onlinePlayers.get(socket.id);
-    onlinePlayers.set(socket.id, {
-      userId: existing?.userId || null,
-      name: finalName,
-      username: normalizeUsername(finalName),
-      avatar: existing?.avatar || '🤖',
-      status: 'online',
-      socketId: socket.id,
-      connectedAt: existing?.connectedAt || Date.now(),
-    });
-
-    console.log('[REGISTER]', socket.id, '→', finalName);
-    socket.emit('usernameRegistered', { name: finalName });
-    broadcastOnlineUsers();
-    broadcastOnlineCount();
-  });
-
-  // ============================================
-  // ONLINE USERS LIST (request current list)
-  // ============================================
   socket.on('getOnlineUsers', () => {
     const users = [];
     for (const [socketId, player] of onlinePlayers) {
@@ -232,12 +255,8 @@ io.on('connection', (socket) => {
     socket.emit('onlineUsers', { users });
   });
 
-  // ============================================
-  // SEARCH PLAYER
-  // ============================================
   socket.on('searchPlayer', (data) => {
     const target = normalizeUsername(data.username || '');
-
     if (!target) {
       socket.emit('searchResult', { found: false, message: 'Enter a username' });
       return;
@@ -269,9 +288,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ============================================
-  // INVITES
-  // ============================================
   socket.on('sendInvite', (data) => {
     const fromPlayer = players.get(socket.id);
     if (!fromPlayer) return;
@@ -350,6 +366,8 @@ io.on('connection', (socket) => {
         winner: null,
         disconnectTimer: null,
         disconnectedPlayer: null,
+        battleMode: data.battleMode || 'human',
+        avatarAutoTimer: null,
       };
       rooms.set(roomCode, room);
 
@@ -379,6 +397,7 @@ io.on('connection', (socket) => {
         opponentName: toPlayerData?.name || 'Player',
         opponentId: invite.toId,
         players: playerList,
+        battleMode: room.battleMode,
       });
 
       io.to(invite.toId).emit('inviteAccepted', {
@@ -388,6 +407,7 @@ io.on('connection', (socket) => {
         opponentName: fromPlayerData?.name || 'Player',
         opponentId: invite.fromId,
         players: playerList,
+        battleMode: room.battleMode,
       });
 
       io.to(roomCode).emit('roomState', {
@@ -404,7 +424,11 @@ io.on('connection', (socket) => {
       recordRecentOpponent(invite.toId, invite.fromId);
       broadcastOnlineUsers();
 
-      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode);
+      if (room.battleMode === 'avatar') {
+        setTimeout(() => startAvatarAutoPlay(roomCode), 1500);
+      }
+
+      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode, `(${room.battleMode})`);
     } else {
       invite.status = 'declined';
       io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
@@ -425,9 +449,6 @@ io.on('connection', (socket) => {
     socket.emit('recentOpponents', enriched);
   });
 
-  // ============================================
-  // ROOM MANAGEMENT
-  // ============================================
   socket.on('createRoom', (data) => {
     let roomCode;
 
@@ -452,6 +473,8 @@ io.on('connection', (socket) => {
       winner: null,
       disconnectTimer: null,
       disconnectedPlayer: null,
+      battleMode: data.battleMode || 'human',
+      avatarAutoTimer: null,
     };
     rooms.set(roomCode, room);
 
@@ -469,7 +492,7 @@ io.on('connection', (socket) => {
       playerName: player?.name || 'Player 1',
     });
 
-    console.log('[CREATE ROOM]', socket.id, '→', roomCode);
+    console.log('[CREATE ROOM]', socket.id, '→', roomCode, `(${room.battleMode})`);
   });
 
   socket.on('getHostCode', () => {
@@ -532,11 +555,12 @@ io.on('connection', (socket) => {
     });
 
     console.log('[JOIN ROOM]', socket.id, '→', code);
+
+    if (room.battleMode === 'avatar' && room.players.length === 2) {
+      setTimeout(() => startAvatarAutoPlay(code), 1500);
+    }
   });
 
-  // ============================================
-  // GAMEPLAY
-  // ============================================
   socket.on('makeMove', (data) => {
     const player = players.get(socket.id);
     if (!player || !player.room) return;
@@ -544,6 +568,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(player.room);
     if (!room) return;
     if (room.matchOver) return;
+    if (room.battleMode === 'avatar') return;
 
     room.moves[socket.id] = data.move;
 
@@ -557,11 +582,7 @@ io.on('connection', (socket) => {
       const move1 = room.moves[p1];
       const move2 = room.moves[p2];
 
-      let result = 'tie';
-      if (move1 !== move2) {
-        const rules = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
-        result = rules[move1] === move2 ? 'p1' : 'p2';
-      }
+      const result = resolveRound(room, move1, move2);
 
       if (result === 'p1') room.scores[p1]++;
       else if (result === 'p2') room.scores[p2]++;
@@ -619,6 +640,11 @@ io.on('connection', (socket) => {
     const room = rooms.get(player.room);
     if (!room) return;
 
+    if (room.avatarAutoTimer) {
+      clearTimeout(room.avatarAutoTimer);
+      room.avatarAutoTimer = null;
+    }
+
     resetRoomScores(room);
 
     io.to(player.room).emit('gameReset', {
@@ -627,6 +653,10 @@ io.on('connection', (socket) => {
     });
 
     broadcastRoomState(room);
+
+    if (room.battleMode === 'avatar' && room.players.length === 2) {
+      setTimeout(() => startAvatarAutoPlay(room.code), 1500);
+    }
   });
 
   socket.on('leaveRoom', () => {
@@ -656,6 +686,11 @@ function handleDisconnect(socketId) {
   if (!room) {
     players.delete(socketId);
     return;
+  }
+
+  if (room.avatarAutoTimer) {
+    clearTimeout(room.avatarAutoTimer);
+    room.avatarAutoTimer = null;
   }
 
   if (room.matchOver) {
@@ -711,6 +746,10 @@ function handleLeave(socketId, notify = false) {
       if (room.disconnectTimer) {
         clearTimeout(room.disconnectTimer);
         room.disconnectTimer = null;
+      }
+      if (room.avatarAutoTimer) {
+        clearTimeout(room.avatarAutoTimer);
+        room.avatarAutoTimer = null;
       }
       room.disconnectedPlayer = null;
 
