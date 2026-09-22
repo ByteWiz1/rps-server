@@ -20,7 +20,7 @@ const recentOpponents = new Map();
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
-const AVATAR_ROUND_DELAY = 1000;
+const AVATAR_ROUND_DELAY = 2000;
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
