@@ -17,10 +17,15 @@ const onlinePlayers = new Map();
 const activeInvites = new Map();
 const recentOpponents = new Map();
 
+// 🆕 Persistent-ish stores (reset on server restart)
+const matchHistory = new Map();  // userId -> [match, match, ...]
+const playerStats = new Map();   // userId -> { wins, losses, ties, total }
+
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
 const AVATAR_ROUND_DELAY = 2000;
+const MAX_HISTORY = 20;          // 🆕 keep last 20 matches per user
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -139,6 +144,76 @@ function resolveRound(move1, move2) {
   return rules[move1] === move2 ? 'p1' : 'p2';
 }
 
+// 🆕 Record a finished match into history + stats
+function recordMatchResult(room) {
+  if (!room || !room.winner) return;
+
+  const [p1, p2] = room.players;
+  if (!p1 || !p2) return;
+
+  const p1UserId = onlinePlayers.get(p1)?.userId || players.get(p1)?.userId;
+  const p2UserId = onlinePlayers.get(p2)?.userId || players.get(p2)?.userId;
+  if (!p1UserId || !p2UserId) return;
+
+  const p1Name = players.get(p1)?.name || 'Player 1';
+  const p2Name = players.get(p2)?.name || 'Player 2';
+
+  const p1Won = room.winner === p1;
+  const p2Won = room.winner === p2;
+
+  const baseMatch = {
+    mode: room.battleMode,
+    p1Score: room.scores[p1] || 0,
+    p2Score: room.scores[p2] || 0,
+    p1Ties: room.ties[p1] || 0,
+    p2Ties: room.ties[p2] || 0,
+    rounds: room.round,
+    timestamp: Date.now(),
+  };
+
+  // ─── p1's view ───
+  const p1History = matchHistory.get(p1UserId) || [];
+  p1History.unshift({
+    ...baseMatch,
+    opponent: p2Name,
+    opponentId: p2UserId,
+    result: p1Won ? 'win' : 'loss',
+    myScore: baseMatch.p1Score,
+    theirScore: baseMatch.p2Score,
+  });
+  matchHistory.set(p1UserId, p1History.slice(0, MAX_HISTORY));
+
+  const p1Stats = playerStats.get(p1UserId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+  if (p1Won) p1Stats.wins++;
+  else p1Stats.losses++;
+  p1Stats.total = p1Stats.wins + p1Stats.losses;
+  playerStats.set(p1UserId, p1Stats);
+
+  // ─── p2's view ───
+  const p2History = matchHistory.get(p2UserId) || [];
+  p2History.unshift({
+    ...baseMatch,
+    opponent: p1Name,
+    opponentId: p1UserId,
+    result: p2Won ? 'win' : 'loss',
+    myScore: baseMatch.p2Score,
+    theirScore: baseMatch.p1Score,
+  });
+  matchHistory.set(p2UserId, p2History.slice(0, MAX_HISTORY));
+
+  const p2Stats = playerStats.get(p2UserId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+  if (p2Won) p2Stats.wins++;
+  else p2Stats.losses++;
+  p2Stats.total = p2Stats.wins + p2Stats.losses;
+  playerStats.set(p2UserId, p2Stats);
+
+  // Push fresh stats to both if still connected
+  io.to(p1).emit('playerStats', { stats: playerStats.get(p1UserId) });
+  io.to(p2).emit('playerStats', { stats: playerStats.get(p2UserId) });
+
+  console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name);
+}
+
 function startAvatarAutoPlay(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -177,6 +252,7 @@ function startAvatarAutoPlay(roomCode) {
       r.matchOver = true;
       r.winner = matchWinner;
       resetPlayersToOnline(r);
+      recordMatchResult(r); // 🆕
     }
 
     io.to(roomCode).emit('roundResult', {
@@ -245,7 +321,130 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
+    // 🆕 Send existing stats immediately
+    const existingStats = playerStats.get(userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+    socket.emit('playerStats', { stats: existingStats });
+
     console.log('[IDENTITY]', socket.id, '→', username);
+  });
+
+  // 🆕 CHANGE USERNAME
+  socket.on('changeUsername', (data) => {
+    const newUsername = (data.newUsername || '').trim().slice(0, 15);
+    const userId = (data.userId || '').trim();
+
+    if (!userId || newUsername.length < 3) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'Username must be at least 3 characters',
+      });
+      return;
+    }
+
+    const normalized = normalizeUsername(newUsername);
+    if (!normalized || normalized.length < 3) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'Username can only contain letters, numbers, and underscores',
+      });
+      return;
+    }
+
+    let taken = false;
+    for (const [socketId, player] of onlinePlayers) {
+      if (socketId === socket.id) continue;
+      if (player.username === normalized) {
+        taken = true;
+        break;
+      }
+    }
+
+    if (taken) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'That username is already taken',
+      });
+      return;
+    }
+
+    const player = players.get(socket.id);
+    if (player) {
+      player.name = newUsername;
+      player.username = normalized;
+    }
+
+    if (onlinePlayers.has(socket.id)) {
+      const entry = onlinePlayers.get(socket.id);
+      entry.name = newUsername;
+      entry.username = normalized;
+    }
+
+    broadcastOnlineUsers();
+
+    socket.emit('changeUsernameResult', {
+      success: true,
+      username: newUsername,
+      message: 'Username updated',
+    });
+
+    console.log('[CHANGE USERNAME]', socket.id, '→', newUsername);
+  });
+
+  // 🆕 DELETE ACCOUNT
+  socket.on('deleteAccount', () => {
+    console.log('[DELETE ACCOUNT]', socket.id);
+
+    const player = players.get(socket.id);
+    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+
+    if (player && player.room) {
+      handleLeave(socket.id, true);
+    }
+
+    onlinePlayers.delete(socket.id);
+    broadcastOnlineUsers();
+    broadcastOnlineCount();
+
+    players.delete(socket.id);
+
+    // 🆕 Wipe stored stats/history for this user
+    if (userId) {
+      matchHistory.delete(userId);
+      playerStats.delete(userId);
+    }
+
+    socket.emit('deleteAccountResult', {
+      success: true,
+      message: 'Account deleted',
+    });
+
+    setTimeout(() => {
+      socket.disconnect(true);
+    }, 300);
+  });
+
+  // 🆕 GET MATCH HISTORY
+  socket.on('getMatchHistory', () => {
+    const player = players.get(socket.id);
+    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+    if (!userId) {
+      socket.emit('matchHistory', { matches: [] });
+      return;
+    }
+    const matches = matchHistory.get(userId) || [];
+    socket.emit('matchHistory', { matches });
+  });
+
+  // 🆕 GET PLAYER STATS
+  socket.on('getPlayerStats', () => {
+    const player = players.get(socket.id);
+    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+    if (!userId) {
+      socket.emit('playerStats', { stats: { wins: 0, losses: 0, ties: 0, total: 0 } });
+      return;
+    }
+    const stats = playerStats.get(userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+    socket.emit('playerStats', { stats });
   });
 
   socket.on('getOnlineUsers', () => {
@@ -606,6 +805,7 @@ io.on('connection', (socket) => {
         room.matchOver = true;
         room.winner = matchWinner;
         resetPlayersToOnline(room);
+        recordMatchResult(room); // 🆕
       }
 
       io.to(player.room).emit('roundResult', {
@@ -731,6 +931,7 @@ function handleDisconnect(socketId) {
       room.matchOver = true;
       room.winner = winnerId;
       resetPlayersToOnline(room);
+      recordMatchResult(room); // 🆕
       io.to(winnerId).emit('opponentTimedOut', {
         winnerId,
         loserId: disconnectedId,
@@ -772,7 +973,6 @@ function handleLeave(socketId, notify = false) {
       if (onlinePlayers.has(socketId)) {
         onlinePlayers.get(socketId).status = 'online';
       }
-      // Also reset remaining players back to online
       if (room) {
         resetPlayersToOnline(room);
       }
