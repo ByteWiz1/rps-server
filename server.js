@@ -16,16 +16,14 @@ const players = new Map();
 const onlinePlayers = new Map();
 const activeInvites = new Map();
 const recentOpponents = new Map();
-
-// 🆕 Persistent-ish stores (reset on server restart)
-const matchHistory = new Map();  // userId -> [match, match, ...]
-const playerStats = new Map();   // userId -> { wins, losses, ties, total }
+const matchHistory = new Map();
+const playerStats = new Map();
 
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
 const AVATAR_ROUND_DELAY = 2000;
-const MAX_HISTORY = 20;          // 🆕 keep last 20 matches per user
+const MAX_HISTORY = 20;
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -144,7 +142,6 @@ function resolveRound(move1, move2) {
   return rules[move1] === move2 ? 'p1' : 'p2';
 }
 
-// 🆕 Record a finished match into history + stats
 function recordMatchResult(room) {
   if (!room || !room.winner) return;
 
@@ -171,7 +168,6 @@ function recordMatchResult(room) {
     timestamp: Date.now(),
   };
 
-  // ─── p1's view ───
   const p1History = matchHistory.get(p1UserId) || [];
   p1History.unshift({
     ...baseMatch,
@@ -189,7 +185,6 @@ function recordMatchResult(room) {
   p1Stats.total = p1Stats.wins + p1Stats.losses;
   playerStats.set(p1UserId, p1Stats);
 
-  // ─── p2's view ───
   const p2History = matchHistory.get(p2UserId) || [];
   p2History.unshift({
     ...baseMatch,
@@ -207,7 +202,6 @@ function recordMatchResult(room) {
   p2Stats.total = p2Stats.wins + p2Stats.losses;
   playerStats.set(p2UserId, p2Stats);
 
-  // Push fresh stats to both if still connected
   io.to(p1).emit('playerStats', { stats: playerStats.get(p1UserId) });
   io.to(p2).emit('playerStats', { stats: playerStats.get(p2UserId) });
 
@@ -216,9 +210,14 @@ function recordMatchResult(room) {
 
 function startAvatarAutoPlay(roomCode) {
   const room = rooms.get(roomCode);
+  console.log('[AVATAR AUTO] Called for room', roomCode, '| battleMode:', room?.battleMode, '| players:', room?.players.length);
   if (!room) return;
   if (room.avatarAutoTimer) clearTimeout(room.avatarAutoTimer);
   if (room.matchOver) return;
+  if (room.players.length < 2) {
+    console.log('[AVATAR AUTO] Aborted — not enough players');
+    return;
+  }
 
   const runRound = () => {
     const r = rooms.get(roomCode);
@@ -252,7 +251,7 @@ function startAvatarAutoPlay(roomCode) {
       r.matchOver = true;
       r.winner = matchWinner;
       resetPlayersToOnline(r);
-      recordMatchResult(r); // 🆕
+      recordMatchResult(r);
     }
 
     io.to(roomCode).emit('roundResult', {
@@ -321,14 +320,12 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    // 🆕 Send existing stats immediately
     const existingStats = playerStats.get(userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
     socket.emit('playerStats', { stats: existingStats });
 
-    console.log('[IDENTITY]', socket.id, '→', username);
+    console.log('[IDENTITY]', socket.id, '→', username, `(${userId})`);
   });
 
-  // 🆕 CHANGE USERNAME
   socket.on('changeUsername', (data) => {
     const newUsername = (data.newUsername || '').trim().slice(0, 15);
     const userId = (data.userId || '').trim();
@@ -390,7 +387,6 @@ io.on('connection', (socket) => {
     console.log('[CHANGE USERNAME]', socket.id, '→', newUsername);
   });
 
-  // 🆕 DELETE ACCOUNT
   socket.on('deleteAccount', () => {
     console.log('[DELETE ACCOUNT]', socket.id);
 
@@ -407,7 +403,6 @@ io.on('connection', (socket) => {
 
     players.delete(socket.id);
 
-    // 🆕 Wipe stored stats/history for this user
     if (userId) {
       matchHistory.delete(userId);
       playerStats.delete(userId);
@@ -423,7 +418,6 @@ io.on('connection', (socket) => {
     }, 300);
   });
 
-  // 🆕 GET MATCH HISTORY
   socket.on('getMatchHistory', () => {
     const player = players.get(socket.id);
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
@@ -435,7 +429,6 @@ io.on('connection', (socket) => {
     socket.emit('matchHistory', { matches });
   });
 
-  // 🆕 GET PLAYER STATS
   socket.on('getPlayerStats', () => {
     const player = players.get(socket.id);
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
@@ -515,7 +508,7 @@ io.on('connection', (socket) => {
       toName: targetPlayer.name,
       status: 'pending',
       createdAt: Date.now(),
-      battleMode: data.battleMode || 'human',
+      battleMode: data.battleMode || 'human', // ← FIX: from client or default
     };
 
     activeInvites.set(inviteId, invite);
@@ -563,6 +556,9 @@ io.on('connection', (socket) => {
     if (data.accepted) {
       invite.status = 'accepted';
 
+      // ← FIX: invite's mode is the source of truth
+      const resolvedMode = invite.battleMode || data.battleMode || 'human';
+
       const roomCode = generateRoomCode();
       const room = {
         code: roomCode,
@@ -575,7 +571,7 @@ io.on('connection', (socket) => {
         winner: null,
         disconnectTimer: null,
         disconnectedPlayer: null,
-        battleMode: invite.battleMode || 'human',
+        battleMode: resolvedMode,
         avatarAutoTimer: null,
       };
       rooms.set(roomCode, room);
@@ -633,17 +629,31 @@ io.on('connection', (socket) => {
       recordRecentOpponent(invite.fromId, invite.toId);
       recordRecentOpponent(invite.toId, invite.fromId);
 
+      // ← FIX: auto-play with longer setup delay so both clients are ready
       if (room.battleMode === 'avatar') {
-        setTimeout(() => startAvatarAutoPlay(roomCode), AVATAR_ROUND_DELAY);
+        console.log('[ACCEPT] Scheduling avatar auto-play for room', roomCode);
+        setTimeout(() => startAvatarAutoPlay(roomCode), 2000);
       }
 
-      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, `(${room.battleMode})`);
+      console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode, `(${room.battleMode})`);
     } else {
       invite.status = 'declined';
       io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
     }
 
     activeInvites.delete(invite.id);
+  });
+
+  socket.on('getRecentOpponents', () => {
+    const list = recentOpponents.get(socket.id) || [];
+    const enriched = list.map((item) => {
+      const online = onlinePlayers.has(item.id);
+      return {
+        ...item,
+        status: online ? onlinePlayers.get(item.id).status : 'offline',
+      };
+    });
+    socket.emit('recentOpponents', enriched);
   });
 
   socket.on('createRoom', (data) => {
@@ -687,6 +697,7 @@ io.on('connection', (socket) => {
       code: roomCode,
       playerId: socket.id,
       playerName: player?.name || 'Player 1',
+      battleMode: room.battleMode,
     });
 
     console.log('[CREATE ROOM]', socket.id, '→', roomCode, `(${room.battleMode})`);
@@ -759,10 +770,13 @@ io.on('connection', (socket) => {
       ties: room.ties,
     });
 
-    console.log('[JOIN ROOM]', socket.id, '→', code);
+    console.log('[JOIN ROOM]', socket.id, '→', code, `(${room.battleMode})`);
+    console.log('[JOIN ROOM] battleMode:', room.battleMode, '| players:', room.players.length);
 
+    // ← FIX: auto-play with setup delay
     if (room.battleMode === 'avatar' && room.players.length === 2) {
-      setTimeout(() => startAvatarAutoPlay(code), AVATAR_ROUND_DELAY);
+      console.log('[JOIN ROOM] Scheduling avatar auto-play for room', code);
+      setTimeout(() => startAvatarAutoPlay(code), 2000);
     }
   });
 
@@ -805,7 +819,7 @@ io.on('connection', (socket) => {
         room.matchOver = true;
         room.winner = matchWinner;
         resetPlayersToOnline(room);
-        recordMatchResult(room); // 🆕
+        recordMatchResult(room);
       }
 
       io.to(player.room).emit('roundResult', {
@@ -863,7 +877,7 @@ io.on('connection', (socket) => {
     broadcastRoomState(room);
 
     if (room.battleMode === 'avatar' && room.players.length === 2) {
-      setTimeout(() => startAvatarAutoPlay(room.code), AVATAR_ROUND_DELAY);
+      setTimeout(() => startAvatarAutoPlay(room.code), 2000);
     }
   });
 
@@ -931,7 +945,7 @@ function handleDisconnect(socketId) {
       room.matchOver = true;
       room.winner = winnerId;
       resetPlayersToOnline(room);
-      recordMatchResult(room); // 🆕
+      recordMatchResult(room);
       io.to(winnerId).emit('opponentTimedOut', {
         winnerId,
         loserId: disconnectedId,
