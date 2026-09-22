@@ -455,6 +455,10 @@ io.on('connection', (socket) => {
     socket.emit('onlineUsers', { users });
   });
 
+  socket.on('getOnlineCount', () => {
+  socket.emit('onlineCount', { count: onlinePlayers.size });
+});
+
   socket.on('searchPlayer', (data) => {
     const target = normalizeUsername(data.username || '');
     if (!target) {
