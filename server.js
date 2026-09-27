@@ -69,6 +69,17 @@ function getRoomPlayers(room) {
   }));
 }
 
+// ─── Status helper: the ONE way to change a player's status ───
+function setPlayerStatus(socketId, status) {
+  if (!socketId) return;
+  const entry = onlinePlayers.get(socketId);
+  if (!entry) return;
+  if (entry.status === status) return; // no change — no broadcast
+  entry.status = status;
+  broadcastOnlineUsers();
+  console.log('[STATUS]', socketId, '→', status);
+}
+
 // ─── Recent moves helpers ───
 function pushRecentMove(room, playerId, move) {
   if (!room || !playerId || !move) return;
@@ -140,14 +151,21 @@ function broadcastOnlineCount() {
   io.emit('onlineCount', { count: onlinePlayers.size });
 }
 
+// Reset every player currently in the room to 'online' (bulk, on match end)
 function resetPlayersToOnline(room) {
   if (!room) return;
+  let changed = false;
   room.players.forEach((id) => {
-    if (onlinePlayers.has(id)) {
-      onlinePlayers.get(id).status = 'online';
+    const entry = onlinePlayers.get(id);
+    if (entry && entry.status !== 'online') {
+      entry.status = 'online';
+      changed = true;
+      console.log('[STATUS]', id, '→ online (bulk)');
     }
   });
-  broadcastOnlineUsers();
+  if (changed) {
+    broadcastOnlineUsers();
+  }
 }
 
 function recordRecentOpponent(playerId, opponentId) {
@@ -272,7 +290,6 @@ function startAvatarAutoPlay(roomCode) {
     }
     r.round++;
 
-    // ─── push recent moves ───
     pushRecentMove(r, p1, move1);
     pushRecentMove(r, p2, move2);
 
@@ -623,13 +640,9 @@ io.on('connection', (socket) => {
       if (fromPlayerData) fromPlayerData.room = roomCode;
       if (toPlayerData) toPlayerData.room = roomCode;
 
-      if (onlinePlayers.has(invite.fromId)) {
-        onlinePlayers.get(invite.fromId).status = 'in-match';
-      }
-      if (onlinePlayers.has(invite.toId)) {
-        onlinePlayers.get(invite.toId).status = 'in-match';
-      }
-      broadcastOnlineUsers();
+      // Status → in-match (helper broadcasts)
+      setPlayerStatus(invite.fromId, 'in-match');
+      setPlayerStatus(invite.toId, 'in-match');
 
       const fromSocket = io.sockets.sockets.get(invite.fromId);
       const toSocket = io.sockets.sockets.get(invite.toId);
@@ -809,13 +822,9 @@ io.on('connection', (socket) => {
 
     socket.join(code);
 
-    if (onlinePlayers.has(socket.id)) {
-      onlinePlayers.get(socket.id).status = 'in-match';
-    }
-    if (onlinePlayers.has(room.players[0])) {
-      onlinePlayers.get(room.players[0]).status = 'in-match';
-    }
-    broadcastOnlineUsers();
+    // Status → in-match (helper broadcasts)
+    setPlayerStatus(socket.id, 'in-match');
+    setPlayerStatus(room.players[0], 'in-match');
 
     resetRoomScores(room);
     broadcastRoomState(room);
@@ -882,7 +891,6 @@ io.on('connection', (socket) => {
       }
       room.round++;
 
-      // ─── push recent moves ───
       pushRecentMove(room, p1, move1);
       pushRecentMove(room, p2, move2);
 
@@ -1059,16 +1067,17 @@ function handleLeave(socketId, notify = false) {
       }
 
       room.players = room.players.filter((id) => id !== socketId);
-      if (room.players.length === 0) rooms.delete(player.room);
-
-      if (onlinePlayers.has(socketId)) {
-        onlinePlayers.get(socketId).status = 'online';
-      }
-      if (room) {
+      if (room.players.length === 0) {
+        rooms.delete(player.room);
+      } else {
+        // Remaining players → online (bulk broadcast)
         resetPlayersToOnline(room);
       }
     }
   }
+
+  // Leaver → online (helper broadcasts)
+  setPlayerStatus(socketId, 'online');
 
   players.delete(socketId);
 }
