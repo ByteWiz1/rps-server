@@ -24,6 +24,7 @@ const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
 const AVATAR_ROUND_DELAY = 2000;
 const MAX_HISTORY = 20;
+const MAX_RECENT_MOVES = 5;
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -68,6 +69,32 @@ function getRoomPlayers(room) {
   }));
 }
 
+// ─── Recent moves helpers ───
+function pushRecentMove(room, playerId, move) {
+  if (!room || !playerId || !move) return;
+  if (!room.recentMoves) room.recentMoves = {};
+  const list = room.recentMoves[playerId] || [];
+  list.push(move);
+  room.recentMoves[playerId] = list.slice(-MAX_RECENT_MOVES);
+}
+
+function resetRecentMoves(room) {
+  if (!room) return;
+  room.recentMoves = {};
+  room.players.forEach((id) => {
+    room.recentMoves[id] = [];
+  });
+}
+
+function buildRecentMovesPayload(room) {
+  if (!room || !room.recentMoves) return {};
+  const payload = {};
+  room.players.forEach((id) => {
+    payload[id] = room.recentMoves[id] || [];
+  });
+  return payload;
+}
+
 function resetRoomScores(room) {
   room.players.forEach((id) => {
     room.scores[id] = 0;
@@ -77,6 +104,7 @@ function resetRoomScores(room) {
   room.round = 0;
   room.matchOver = false;
   room.winner = null;
+  resetRecentMoves(room);
 }
 
 function broadcastRoomState(room) {
@@ -89,6 +117,7 @@ function broadcastRoomState(room) {
     matchOver: room.matchOver,
     winner: room.winner,
     winTarget: WIN_TARGET,
+    recentMoves: buildRecentMovesPayload(room),
   });
 }
 
@@ -243,6 +272,10 @@ function startAvatarAutoPlay(roomCode) {
     }
     r.round++;
 
+    // ─── push recent moves ───
+    pushRecentMove(r, p1, move1);
+    pushRecentMove(r, p2, move2);
+
     let matchWinner = null;
     if (r.scores[p1] >= WIN_TARGET) matchWinner = p1;
     else if (r.scores[p2] >= WIN_TARGET) matchWinner = p2;
@@ -263,6 +296,7 @@ function startAvatarAutoPlay(roomCode) {
       matchOver: r.matchOver,
       matchWinner,
       winTarget: WIN_TARGET,
+      recentMoves: buildRecentMovesPayload(r),
     });
 
     if (!r.matchOver) {
@@ -456,8 +490,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('getOnlineCount', () => {
-  socket.emit('onlineCount', { count: onlinePlayers.size });
-});
+    socket.emit('onlineCount', { count: onlinePlayers.size });
+  });
 
   socket.on('searchPlayer', (data) => {
     const target = normalizeUsername(data.username || '');
@@ -512,7 +546,7 @@ io.on('connection', (socket) => {
       toName: targetPlayer.name,
       status: 'pending',
       createdAt: Date.now(),
-      battleMode: data.battleMode || 'human', // ← FIX: from client or default
+      battleMode: data.battleMode || 'human',
     };
 
     activeInvites.set(inviteId, invite);
@@ -539,6 +573,7 @@ io.on('connection', (socket) => {
     socket.emit('inviteSent', {
       inviteId: invite.id,
       toName: targetPlayer.name,
+      toId: targetSocketId,
     });
 
     console.log('[INVITE]', fromPlayer.name, '→', targetPlayer.name, `(${invite.battleMode})`);
@@ -560,7 +595,6 @@ io.on('connection', (socket) => {
     if (data.accepted) {
       invite.status = 'accepted';
 
-      // ← FIX: invite's mode is the source of truth
       const resolvedMode = invite.battleMode || data.battleMode || 'human';
 
       const roomCode = generateRoomCode();
@@ -577,6 +611,10 @@ io.on('connection', (socket) => {
         disconnectedPlayer: null,
         battleMode: resolvedMode,
         avatarAutoTimer: null,
+        recentMoves: {
+          [invite.fromId]: [],
+          [invite.toId]: [],
+        },
       };
       rooms.set(roomCode, room);
 
@@ -620,6 +658,16 @@ io.on('connection', (socket) => {
         battleMode: room.battleMode,
       });
 
+      io.to(roomCode).emit('roomReady', {
+        roomCode,
+        battleMode: room.battleMode,
+        players: playerList,
+        reason: 'invite-accept',
+        hostId: invite.fromId,
+        guestId: invite.toId,
+        recentMoves: buildRecentMovesPayload(room),
+      });
+
       io.to(roomCode).emit('roomState', {
         players: playerList,
         scores: room.scores,
@@ -628,12 +676,12 @@ io.on('connection', (socket) => {
         matchOver: room.matchOver,
         winner: room.winner,
         winTarget: WIN_TARGET,
+        recentMoves: buildRecentMovesPayload(room),
       });
 
       recordRecentOpponent(invite.fromId, invite.toId);
       recordRecentOpponent(invite.toId, invite.fromId);
 
-      // ← FIX: auto-play with longer setup delay so both clients are ready
       if (room.battleMode === 'avatar') {
         console.log('[ACCEPT] Scheduling avatar auto-play for room', roomCode);
         setTimeout(() => startAvatarAutoPlay(roomCode), 2000);
@@ -642,7 +690,11 @@ io.on('connection', (socket) => {
       console.log('[ACCEPT]', fromPlayerData?.name, 'vs', toPlayerData?.name, '→ room', roomCode, `(${room.battleMode})`);
     } else {
       invite.status = 'declined';
-      io.to(invite.fromId).emit('inviteDeclined', { inviteId: invite.id });
+
+      io.to(invite.fromId).emit('inviteDeclined', {
+        inviteId: invite.id,
+        byName: players.get(socket.id)?.name || 'Player',
+      });
     }
 
     activeInvites.delete(invite.id);
@@ -686,6 +738,7 @@ io.on('connection', (socket) => {
       disconnectedPlayer: null,
       battleMode: data.battleMode || 'human',
       avatarAutoTimer: null,
+      recentMoves: { [socket.id]: [] },
     };
     rooms.set(roomCode, room);
 
@@ -702,6 +755,7 @@ io.on('connection', (socket) => {
       playerId: socket.id,
       playerName: player?.name || 'Player 1',
       battleMode: room.battleMode,
+      recentMoves: buildRecentMovesPayload(room),
     });
 
     console.log('[CREATE ROOM]', socket.id, '→', roomCode, `(${room.battleMode})`);
@@ -744,6 +798,9 @@ io.on('connection', (socket) => {
     room.scores[socket.id] = 0;
     room.ties[socket.id] = 0;
 
+    if (!room.recentMoves) room.recentMoves = {};
+    room.recentMoves[socket.id] = [];
+
     const player = players.get(socket.id);
     if (player) {
       player.room = code;
@@ -769,15 +826,25 @@ io.on('connection', (socket) => {
       playerName: player?.name || 'Player 2',
     });
 
+    io.to(code).emit('roomReady', {
+      roomCode: code,
+      battleMode: room.battleMode,
+      players: getRoomPlayers(room),
+      reason: 'code-join',
+      hostId: room.players[0],
+      guestId: socket.id,
+      recentMoves: buildRecentMovesPayload(room),
+    });
+
     io.to(code).emit('gameReset', {
       scores: room.scores,
       ties: room.ties,
+      recentMoves: buildRecentMovesPayload(room),
     });
 
     console.log('[JOIN ROOM]', socket.id, '→', code, `(${room.battleMode})`);
     console.log('[JOIN ROOM] battleMode:', room.battleMode, '| players:', room.players.length);
 
-    // ← FIX: auto-play with setup delay
     if (room.battleMode === 'avatar' && room.players.length === 2) {
       console.log('[JOIN ROOM] Scheduling avatar auto-play for room', code);
       setTimeout(() => startAvatarAutoPlay(code), 2000);
@@ -815,6 +882,10 @@ io.on('connection', (socket) => {
       }
       room.round++;
 
+      // ─── push recent moves ───
+      pushRecentMove(room, p1, move1);
+      pushRecentMove(room, p2, move2);
+
       let matchWinner = null;
       if (room.scores[p1] >= WIN_TARGET) matchWinner = p1;
       else if (room.scores[p2] >= WIN_TARGET) matchWinner = p2;
@@ -835,6 +906,7 @@ io.on('connection', (socket) => {
         matchOver: room.matchOver,
         matchWinner,
         winTarget: WIN_TARGET,
+        recentMoves: buildRecentMovesPayload(room),
       });
 
       room.moves = {};
@@ -876,6 +948,7 @@ io.on('connection', (socket) => {
     io.to(player.room).emit('gameReset', {
       scores: room.scores,
       ties: room.ties,
+      recentMoves: buildRecentMovesPayload(room),
     });
 
     broadcastRoomState(room);
