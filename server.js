@@ -74,7 +74,7 @@ function setPlayerStatus(socketId, status) {
   if (!socketId) return;
   const entry = onlinePlayers.get(socketId);
   if (!entry) return;
-  if (entry.status === status) return; // no change — no broadcast
+  if (entry.status === status) return;
   entry.status = status;
   broadcastOnlineUsers();
   console.log('[STATUS]', socketId, '→', status);
@@ -151,7 +151,7 @@ function broadcastOnlineCount() {
   io.emit('onlineCount', { count: onlinePlayers.size });
 }
 
-// Reset every player currently in the room to 'online' (bulk, on match end)
+// Bulk reset of remaining players to 'online' (used when someone leaves a room)
 function resetPlayersToOnline(room) {
   if (!room) return;
   let changed = false;
@@ -300,8 +300,9 @@ function startAvatarAutoPlay(roomCode) {
     if (matchWinner) {
       r.matchOver = true;
       r.winner = matchWinner;
-      resetPlayersToOnline(r);
       recordMatchResult(r);
+      // NOTE: no resetPlayersToOnline here —
+      // status flips to online when client emits leaveMatchScreen
     }
 
     io.to(roomCode).emit('roundResult', {
@@ -510,6 +511,15 @@ io.on('connection', (socket) => {
     socket.emit('onlineCount', { count: onlinePlayers.size });
   });
 
+  // ─── Match screen presence (client tells us when on/off the match screen) ───
+  socket.on('enterMatchScreen', () => {
+    setPlayerStatus(socket.id, 'in-match');
+  });
+
+  socket.on('leaveMatchScreen', () => {
+    setPlayerStatus(socket.id, 'online');
+  });
+
   socket.on('searchPlayer', (data) => {
     const target = normalizeUsername(data.username || '');
     if (!target) {
@@ -640,9 +650,8 @@ io.on('connection', (socket) => {
       if (fromPlayerData) fromPlayerData.room = roomCode;
       if (toPlayerData) toPlayerData.room = roomCode;
 
-      // Status → in-match (helper broadcasts)
-      setPlayerStatus(invite.fromId, 'in-match');
-      setPlayerStatus(invite.toId, 'in-match');
+      // Status is NOT set to in-match here anymore.
+      // It's set when each client emits `enterMatchScreen` after OnlineGame mounts.
 
       const fromSocket = io.sockets.sockets.get(invite.fromId);
       const toSocket = io.sockets.sockets.get(invite.toId);
@@ -822,9 +831,7 @@ io.on('connection', (socket) => {
 
     socket.join(code);
 
-    // Status → in-match (helper broadcasts)
-    setPlayerStatus(socket.id, 'in-match');
-    setPlayerStatus(room.players[0], 'in-match');
+    // Status NOT set here — client will emit enterMatchScreen when OnlineGame mounts.
 
     resetRoomScores(room);
     broadcastRoomState(room);
@@ -901,8 +908,8 @@ io.on('connection', (socket) => {
       if (matchWinner) {
         room.matchOver = true;
         room.winner = matchWinner;
-        resetPlayersToOnline(room);
         recordMatchResult(room);
+        // NOTE: no resetPlayersToOnline — status is client-driven
       }
 
       io.to(player.room).emit('roundResult', {
@@ -951,7 +958,6 @@ io.on('connection', (socket) => {
     }
 
     resetRoomScores(room);
-    resetPlayersToOnline(room);
 
     io.to(player.room).emit('gameReset', {
       scores: room.scores,
@@ -1029,8 +1035,9 @@ function handleDisconnect(socketId) {
     if (winnerId) {
       room.matchOver = true;
       room.winner = winnerId;
-      resetPlayersToOnline(room);
       recordMatchResult(room);
+      // Remaining player stays in-match (they're still on OnlineGame screen
+      // for the timeout; status flips when they leave the screen).
       io.to(winnerId).emit('opponentTimedOut', {
         winnerId,
         loserId: disconnectedId,
@@ -1070,13 +1077,12 @@ function handleLeave(socketId, notify = false) {
       if (room.players.length === 0) {
         rooms.delete(player.room);
       } else {
-        // Remaining players → online (bulk broadcast)
+        // Remaining players → online (they're no longer in a match)
         resetPlayersToOnline(room);
       }
     }
   }
 
-  // Leaver → online (helper broadcasts)
   setPlayerStatus(socketId, 'online');
 
   players.delete(socketId);
