@@ -1,8 +1,25 @@
+// rps-server/server.js
+//
+// RPS Arena — Node.js + Express + Socket.IO server.
+//
+// Chat 1: server-issued auth tokens, session replacement, status tied to
+//         match-screen presence, roomReady, recentMoves, match history.
+// Chat 2 (this file): adaptive AI engine wired into Avatar Arena, per-mode
+//         stats, overall streaks, pull-based leaderboard.
+//
+// Preserved from Chat 1:
+//   - registerIdentity / sessionReplaced / changeUsername / deleteAccount
+//   - setPlayerStatus + enterMatchScreen / leaveMatchScreen
+//   - roomReady, recentMoves (5/player), AVATAR_ROUND_DELAY = 2000
+//   - match history (last 20 per userId), invites, searchPlayer
+//   - onlineUsers / onlineCount broadcasts
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
+const { createAdaptiveAI } = require('./aiEngine');
 
 const app = express();
 app.use(cors());
@@ -28,9 +45,43 @@ const accountsByUserId = new Map(); // userId   → { token,    username, avatar
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
-const AVATAR_ROUND_DELAY = 2000;
+const AVATAR_ROUND_DELAY = 2000;    // MUST stay 2000
 const MAX_HISTORY = 20;
 const MAX_RECENT_MOVES = 5;
+
+// ─── Stats schema ───
+// Central factory so every stats object has the same shape everywhere.
+function createEmptyStats() {
+  return {
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    total: 0,
+    // per-mode
+    humanWins: 0,
+    humanLosses: 0,
+    humanTies: 0,
+    avatarWins: 0,
+    avatarLosses: 0,
+    avatarTies: 0,
+    dojoWins: 0,
+    dojoLosses: 0,
+    dojoTies: 0,
+    // streaks (overall, across all modes)
+    currentStreak: 0,
+    bestStreak: 0,
+  };
+}
+
+function getOrCreateStats(userId) {
+  if (!userId) return createEmptyStats();
+  let stats = playerStats.get(userId);
+  if (!stats) {
+    stats = createEmptyStats();
+    playerStats.set(userId, stats);
+  }
+  return stats;
+}
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -53,7 +104,7 @@ function normalizeUsername(name) {
   return (name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
 }
 
-// Username uniqueness now scans BOTH live players AND stored accounts,
+// Username uniqueness scans BOTH live players AND stored accounts,
 // so offline users keep their name reserved.
 function isUsernameAvailable(name, exceptUserId) {
   const normalized = normalizeUsername(name);
@@ -179,7 +230,7 @@ function broadcastOnlineCount() {
   io.emit('onlineCount', { count: onlinePlayers.size });
 }
 
-// Bulk reset of remaining players to 'online' (used when someone leaves a room)
+// Bulk reset remaining players to 'online' (used when someone leaves a room)
 function resetPlayersToOnline(room) {
   if (!room) return;
   let changed = false;
@@ -217,6 +268,40 @@ function resolveRound(move1, move2) {
   return rules[move1] === move2 ? 'p1' : 'p2';
 }
 
+// ─── AI state setup ───
+// Called when a room has both players and battleMode === 'avatar'.
+// Creates one AdaptiveAI per player, seeded from each player's chosen
+// avatar personality. Also seeds room.avatarPersonalities.
+function ensureAvatarAI(room) {
+  if (!room || room.battleMode !== 'avatar') return;
+  if (room.players.length < 2) return;
+
+  const [p1, p2] = room.players;
+
+  const p1Personality = room.avatarPersonalities?.[p1];
+  const p2Personality = room.avatarPersonalities?.[p2];
+
+  const p1Name = players.get(p1)?.name || 'Player 1';
+  const p2Name = players.get(p2)?.name || 'Player 2';
+
+  room.aiState = {
+    [p1]: createAdaptiveAI(p1Name, p1Personality),
+    [p2]: createAdaptiveAI(p2Name, p2Personality),
+  };
+
+  console.log(
+    '[AI] Room', room.code, 'AI created |',
+    p1Name, '→', room.aiState[p1].difficulty, room.aiState[p1].personality,
+    '|', p2Name, '→', room.aiState[p2].difficulty, room.aiState[p2].personality,
+  );
+}
+
+function clearAvatarAI(room) {
+  if (!room) return;
+  room.aiState = null;
+}
+
+// ─── Match result recording ───
 function recordMatchResult(room) {
   if (!room || !room.winner) return;
 
@@ -233,6 +318,14 @@ function recordMatchResult(room) {
   const p1Won = room.winner === p1;
   const p2Won = room.winner === p2;
 
+  const mode = room.battleMode || 'human';
+  // Ties are individual rounds; matches always end with a winner (WIN_TARGET),
+  // so at match level a player either won or lost. humanTies/avatarTies/
+  // dojoTies stay at 0 for now (matches never end in a tie).
+  const isHuman = mode === 'human';
+  const isAvatar = mode === 'avatar';
+  const isDojo = mode === 'dojo';
+
   const baseMatch = {
     mode: room.battleMode,
     p1Score: room.scores[p1] || 0,
@@ -243,6 +336,7 @@ function recordMatchResult(room) {
     timestamp: Date.now(),
   };
 
+  // ── P1 history ──
   const p1History = matchHistory.get(p1UserId) || [];
   p1History.unshift({
     ...baseMatch,
@@ -254,12 +348,33 @@ function recordMatchResult(room) {
   });
   matchHistory.set(p1UserId, p1History.slice(0, MAX_HISTORY));
 
-  const p1Stats = playerStats.get(p1UserId) || { wins: 0, losses: 0, ties: 0, total: 0 };
-  if (p1Won) p1Stats.wins++;
-  else p1Stats.losses++;
+  // ── P1 stats ──
+  const p1Stats = getOrCreateStats(p1UserId);
+  if (p1Won) {
+    p1Stats.wins++;
+    p1Stats.currentStreak = (p1Stats.currentStreak || 0) + 1;
+    if (p1Stats.currentStreak > (p1Stats.bestStreak || 0)) {
+      p1Stats.bestStreak = p1Stats.currentStreak;
+    }
+  } else {
+    p1Stats.losses++;
+    p1Stats.currentStreak = 0;
+  }
   p1Stats.total = p1Stats.wins + p1Stats.losses;
+
+  if (isHuman) {
+    if (p1Won) p1Stats.humanWins++;
+    else p1Stats.humanLosses++;
+  } else if (isAvatar) {
+    if (p1Won) p1Stats.avatarWins++;
+    else p1Stats.avatarLosses++;
+  } else if (isDojo) {
+    if (p1Won) p1Stats.dojoWins++;
+    else p1Stats.dojoLosses++;
+  }
   playerStats.set(p1UserId, p1Stats);
 
+  // ── P2 history ──
   const p2History = matchHistory.get(p2UserId) || [];
   p2History.unshift({
     ...baseMatch,
@@ -271,18 +386,93 @@ function recordMatchResult(room) {
   });
   matchHistory.set(p2UserId, p2History.slice(0, MAX_HISTORY));
 
-  const p2Stats = playerStats.get(p2UserId) || { wins: 0, losses: 0, ties: 0, total: 0 };
-  if (p2Won) p2Stats.wins++;
-  else p2Stats.losses++;
+  // ── P2 stats ──
+  const p2Stats = getOrCreateStats(p2UserId);
+  if (p2Won) {
+    p2Stats.wins++;
+    p2Stats.currentStreak = (p2Stats.currentStreak || 0) + 1;
+    if (p2Stats.currentStreak > (p2Stats.bestStreak || 0)) {
+      p2Stats.bestStreak = p2Stats.currentStreak;
+    }
+  } else {
+    p2Stats.losses++;
+    p2Stats.currentStreak = 0;
+  }
   p2Stats.total = p2Stats.wins + p2Stats.losses;
+
+  if (isHuman) {
+    if (p2Won) p2Stats.humanWins++;
+    else p2Stats.humanLosses++;
+  } else if (isAvatar) {
+    if (p2Won) p2Stats.avatarWins++;
+    else p2Stats.avatarLosses++;
+  } else if (isDojo) {
+    if (p2Won) p2Stats.dojoWins++;
+    else p2Stats.dojoLosses++;
+  }
   playerStats.set(p2UserId, p2Stats);
 
   io.to(p1).emit('playerStats', { stats: playerStats.get(p1UserId) });
   io.to(p2).emit('playerStats', { stats: playerStats.get(p2UserId) });
 
-  console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name);
+  console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name, `(${mode})`);
 }
 
+// ─── Leaderboard ───
+function resolveUserMeta(userId) {
+  const acc = accountsByUserId.get(userId);
+  if (acc) {
+    return { username: acc.username, avatar: acc.avatar };
+  }
+  // Fallback: check onlinePlayers for this userId
+  for (const [, p] of onlinePlayers) {
+    if (p.userId === userId) {
+      return { username: p.username, avatar: p.avatar };
+    }
+  }
+  return { username: 'Unknown', avatar: '🤖' };
+}
+
+function buildLeaderboardEntry(userId, stats) {
+  const meta = resolveUserMeta(userId);
+  const total = stats.total || 0;
+  const winRate = total > 0 ? stats.wins / total : 0;
+  return {
+    userId,
+    username: meta.username,
+    avatar: meta.avatar,
+    wins: stats.wins || 0,
+    losses: stats.losses || 0,
+    ties: stats.ties || 0,
+    winRate,
+    bestStreak: stats.bestStreak || 0,
+    total,
+  };
+}
+
+function buildLeaderboard() {
+  const entries = [];
+  for (const [userId, stats] of playerStats) {
+    entries.push(buildLeaderboardEntry(userId, stats));
+  }
+
+  const topByWins = [...entries]
+    .sort((a, b) => b.wins - a.wins || b.winRate - a.winRate)
+    .slice(0, 20);
+
+  const topByWinRate = [...entries]
+    .filter((e) => e.total >= 5)
+    .sort((a, b) => b.winRate - a.winRate || b.wins - a.wins)
+    .slice(0, 20);
+
+  const topByStreak = [...entries]
+    .sort((a, b) => b.bestStreak - a.bestStreak || b.wins - a.wins)
+    .slice(0, 20);
+
+  return { topByWins, topByWinRate, topByStreak };
+}
+
+// ─── Avatar auto-play ───
 function startAvatarAutoPlay(roomCode) {
   const room = rooms.get(roomCode);
   console.log('[AVATAR AUTO] Called for room', roomCode, '| battleMode:', room?.battleMode, '| players:', room?.players.length);
@@ -294,27 +484,55 @@ function startAvatarAutoPlay(roomCode) {
     return;
   }
 
+  // Safety net: if AI wasn't created yet, create it now.
+  if (!room.aiState) {
+    ensureAvatarAI(room);
+  }
+
   const runRound = () => {
     const r = rooms.get(roomCode);
     if (!r) return;
     if (r.matchOver) return;
     if (r.players.length < 2) return;
+    if (!r.aiState) {
+      console.log('[AVATAR AUTO] No AI state — aborting round');
+      return;
+    }
 
     const [p1, p2] = r.players;
-    const moves = ['rock', 'paper', 'scissors'];
-    const move1 = moves[Math.floor(Math.random() * moves.length)];
-    const move2 = moves[Math.floor(Math.random() * moves.length)];
+
+    const ai1 = r.aiState[p1];
+    const ai2 = r.aiState[p2];
+    if (!ai1 || !ai2) {
+      console.log('[AVATAR AUTO] AI instance missing for a player — aborting');
+      return;
+    }
+
+    const move1 = ai1.makeMove();
+    const move2 = ai2.makeMove();
+
+    // Each AI learns from the opponent's move this round.
+    ai1.recordOpponentMove(move2);
+    ai2.recordOpponentMove(move1);
 
     io.to(roomCode).emit('playerMoved', { playerId: p1 });
     io.to(roomCode).emit('playerMoved', { playerId: p2 });
 
     const result = resolveRound(move1, move2);
 
-    if (result === 'p1') r.scores[p1]++;
-    else if (result === 'p2') r.scores[p2]++;
-    else {
+    if (result === 'p1') {
+      r.scores[p1]++;
+      ai1.recordResult('win');
+      ai2.recordResult('lose');
+    } else if (result === 'p2') {
+      r.scores[p2]++;
+      ai2.recordResult('win');
+      ai1.recordResult('lose');
+    } else {
       r.ties[p1] = (r.ties[p1] || 0) + 1;
       r.ties[p2] = (r.ties[p2] || 0) + 1;
+      ai1.recordResult('tie');
+      ai2.recordResult('tie');
     }
     r.round++;
 
@@ -493,7 +711,7 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    const existingStats = playerStats.get(account.userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+    const existingStats = getOrCreateStats(account.userId);
     socket.emit('playerStats', { stats: existingStats });
 
     socket.emit('identityRegistered', {
@@ -627,11 +845,17 @@ io.on('connection', (socket) => {
     const player = players.get(socket.id);
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
     if (!userId) {
-      socket.emit('playerStats', { stats: { wins: 0, losses: 0, ties: 0, total: 0 } });
+      socket.emit('playerStats', { stats: createEmptyStats() });
       return;
     }
-    const stats = playerStats.get(userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+    const stats = getOrCreateStats(userId);
     socket.emit('playerStats', { stats });
+  });
+
+  // ─── Pull-based leaderboard ───
+  socket.on('getLeaderboard', () => {
+    const leaderboard = buildLeaderboard();
+    socket.emit('leaderboard', leaderboard);
   });
 
   socket.on('getOnlineUsers', () => {
@@ -716,6 +940,8 @@ io.on('connection', (socket) => {
       status: 'pending',
       createdAt: Date.now(),
       battleMode: data.battleMode || 'human',
+      // Personality of the inviter's chosen avatar (object | string | undefined)
+      fromAvatarPersonality: data.avatarPersonality ?? null,
     };
 
     activeInvites.set(inviteId, invite);
@@ -784,6 +1010,12 @@ io.on('connection', (socket) => {
           [invite.fromId]: [],
           [invite.toId]: [],
         },
+        // Per-player avatar personality (object | string | undefined)
+        avatarPersonalities: {
+          [invite.fromId]: invite.fromAvatarPersonality ?? null,
+          [invite.toId]: data.avatarPersonality ?? null,
+        },
+        aiState: null,
       };
       rooms.set(roomCode, room);
 
@@ -792,15 +1024,17 @@ io.on('connection', (socket) => {
       if (fromPlayerData) fromPlayerData.room = roomCode;
       if (toPlayerData) toPlayerData.room = roomCode;
 
-      // Status is NOT set to in-match here anymore.
-      // It's set when each client emits `enterMatchScreen` after OnlineGame mounts.
-
       const fromSocket = io.sockets.sockets.get(invite.fromId);
       const toSocket = io.sockets.sockets.get(invite.toId);
       if (fromSocket) fromSocket.join(roomCode);
       if (toSocket) toSocket.join(roomCode);
 
       const playerList = getRoomPlayers(room);
+
+      // If avatar mode, build AI instances now (both players are known).
+      if (room.battleMode === 'avatar') {
+        ensureAvatarAI(room);
+      }
 
       io.to(invite.fromId).emit('inviteAccepted', {
         roomCode,
@@ -903,6 +1137,10 @@ io.on('connection', (socket) => {
       battleMode: data.battleMode || 'human',
       avatarAutoTimer: null,
       recentMoves: { [socket.id]: [] },
+      avatarPersonalities: {
+        [socket.id]: data.avatarPersonality ?? null,
+      },
+      aiState: null,
     };
     rooms.set(roomCode, room);
 
@@ -965,6 +1203,9 @@ io.on('connection', (socket) => {
     if (!room.recentMoves) room.recentMoves = {};
     room.recentMoves[socket.id] = [];
 
+    if (!room.avatarPersonalities) room.avatarPersonalities = {};
+    room.avatarPersonalities[socket.id] = data.avatarPersonality ?? null;
+
     const player = players.get(socket.id);
     if (player) {
       player.room = code;
@@ -972,8 +1213,6 @@ io.on('connection', (socket) => {
     }
 
     socket.join(code);
-
-    // Status NOT set here — client will emit enterMatchScreen when OnlineGame mounts.
 
     resetRoomScores(room);
     broadcastRoomState(room);
@@ -1004,6 +1243,7 @@ io.on('connection', (socket) => {
     console.log('[JOIN ROOM] battleMode:', room.battleMode, '| players:', room.players.length);
 
     if (room.battleMode === 'avatar' && room.players.length === 2) {
+      ensureAvatarAI(room);
       console.log('[JOIN ROOM] Scheduling avatar auto-play for room', code);
       setTimeout(() => startAvatarAutoPlay(code), 2000);
     }
@@ -1099,6 +1339,9 @@ io.on('connection', (socket) => {
       room.avatarAutoTimer = null;
     }
 
+    // Fresh AI for the rematch — the previous match's learning is discarded.
+    clearAvatarAI(room);
+
     resetRoomScores(room);
 
     io.to(player.room).emit('gameReset', {
@@ -1110,6 +1353,7 @@ io.on('connection', (socket) => {
     broadcastRoomState(room);
 
     if (room.battleMode === 'avatar' && room.players.length === 2) {
+      ensureAvatarAI(room);
       setTimeout(() => startAvatarAutoPlay(room.code), 2000);
     }
   });
@@ -1151,6 +1395,7 @@ function handleDisconnect(socketId) {
   if (room.matchOver) {
     io.to(player.room).emit('playerLeft', { playerId: socketId });
     room.players = room.players.filter((id) => id !== socketId);
+    clearAvatarAI(room);
     if (room.players.length === 0) rooms.delete(player.room);
     players.delete(socketId);
     return;
@@ -1178,8 +1423,6 @@ function handleDisconnect(socketId) {
       room.matchOver = true;
       room.winner = winnerId;
       recordMatchResult(room);
-      // Remaining player stays in-match (they're still on OnlineGame screen
-      // for the timeout; status flips when they leave the screen).
       io.to(winnerId).emit('opponentTimedOut', {
         winnerId,
         loserId: disconnectedId,
@@ -1187,6 +1430,7 @@ function handleDisconnect(socketId) {
     }
 
     room.players = room.players.filter((id) => id !== disconnectedId);
+    clearAvatarAI(room);
     if (room.players.length === 0) rooms.delete(room.code);
     players.delete(disconnectedId);
     room.disconnectedPlayer = null;
@@ -1210,6 +1454,7 @@ function handleLeave(socketId, notify = false) {
         room.avatarAutoTimer = null;
       }
       room.disconnectedPlayer = null;
+      clearAvatarAI(room);
 
       if (notify) {
         io.to(player.room).emit('playerLeft', { playerId: socketId });
