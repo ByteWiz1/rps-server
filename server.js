@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -11,13 +12,18 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
+// ─── In-memory state ───
 const rooms = new Map();
-const players = new Map();
-const onlinePlayers = new Map();
+const players = new Map();          // socketId → { room, name, username, userId, token, avatar }
+const onlinePlayers = new Map();    // socketId → { userId, name, username, avatar, status, socketId, token, connectedAt }
 const activeInvites = new Map();
 const recentOpponents = new Map();
 const matchHistory = new Map();
 const playerStats = new Map();
+
+// ─── Auth (Tier 1, in-memory) ───
+const userAccounts = new Map();     // token    → { userId, username, avatar, createdAt }
+const accountsByUserId = new Map(); // userId   → { token,    username, avatar, createdAt }
 
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
@@ -35,23 +41,41 @@ function generateRoomCode() {
   return code;
 }
 
+function generateUserId() {
+  return 'user_' + crypto.randomBytes(12).toString('hex');
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
 function normalizeUsername(name) {
   return (name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
 }
 
-function isUsernameAvailable(name) {
+// Username uniqueness now scans BOTH live players AND stored accounts,
+// so offline users keep their name reserved.
+function isUsernameAvailable(name, exceptUserId) {
   const normalized = normalizeUsername(name);
   if (!normalized) return false;
+
   for (const [, player] of onlinePlayers) {
-    if (player.username === normalized) return false;
+    if (player.username === normalized && player.userId !== exceptUserId) {
+      return false;
+    }
+  }
+  for (const [userId, acc] of accountsByUserId) {
+    if (acc.username === normalized && userId !== exceptUserId) {
+      return false;
+    }
   }
   return true;
 }
 
-function generateUniqueUsername(baseName) {
+function generateUniqueUsername(baseName, exceptUserId) {
   let name = baseName;
   let counter = 1;
-  while (!isUsernameAvailable(name)) {
+  while (!isUsernameAvailable(name, exceptUserId)) {
     name = `${baseName}${counter}`;
     counter++;
     if (counter > 100) {
@@ -63,10 +87,14 @@ function generateUniqueUsername(baseName) {
 }
 
 function getRoomPlayers(room) {
-  return room.players.map((id) => ({
-    id,
-    name: players.get(id)?.name || 'Player',
-  }));
+  return room.players.map((id) => {
+    const p = players.get(id);
+    return {
+      id,
+      name: p?.name || 'Player',
+      userId: p?.userId || null,
+    };
+  });
 }
 
 // ─── Status helper: the ONE way to change a player's status ───
@@ -330,59 +358,172 @@ function startAvatarAutoPlay(roomCode) {
 
 io.on('connection', (socket) => {
   console.log('[CONNECT]', socket.id);
-  players.set(socket.id, { room: null, name: 'Player', username: null, userId: null });
+  players.set(socket.id, {
+    room: null,
+    name: 'Player',
+    username: null,
+    userId: null,
+    token: null,
+    avatar: '🤖',
+  });
 
   socket.emit('connected', { playerId: socket.id });
 
+  // ────────────────────────────────────────────────────────────
+  // registerIdentity
+  //   Fresh:   { token: null,        username, avatar }
+  //   Restore: { token: <hex>,       username?, avatar? }
+  // Responds: identityRegistered { userId, token, username, avatar }
+  // ────────────────────────────────────────────────────────────
   socket.on('registerIdentity', (data) => {
-    const userId = (data.userId || '').trim();
-    const username = (data.username || '').trim().slice(0, 15);
-    const avatar = data.avatar || '🤖';
+    const incomingToken = (typeof data?.token === 'string' && data.token.trim()) || null;
+    const rawUsername = (data?.username || '').trim().slice(0, 15);
+    const incomingAvatar = data?.avatar || null;
 
-    if (!userId || username.length < 3) {
-      socket.emit('identityError', { message: 'Invalid identity data' });
-      return;
-    }
+    let account = null;
 
-    for (const [existingSocketId, existingPlayer] of onlinePlayers) {
-      if (existingPlayer.userId === userId && existingSocketId !== socket.id) {
-        onlinePlayers.delete(existingSocketId);
-        const oldPlayer = players.get(existingSocketId);
-        if (oldPlayer) oldPlayer.userId = null;
+    // Path A: restore existing account via token
+    if (incomingToken) {
+      const found = userAccounts.get(incomingToken);
+      if (found) {
+        account = { ...found };
+        // Optional updates
+        if (rawUsername && rawUsername.length >= 3) {
+          const normalized = normalizeUsername(rawUsername);
+          if (normalized && normalized !== account.username && isUsernameAvailable(normalized, account.userId)) {
+            account.username = normalized;
+          }
+        }
+        if (incomingAvatar) account.avatar = incomingAvatar;
+
+        // Persist updates
+        const stored = userAccounts.get(incomingToken);
+        stored.username = account.username;
+        stored.avatar = account.avatar;
+        const byId = accountsByUserId.get(account.userId);
+        if (byId) {
+          byId.username = account.username;
+          byId.avatar = account.avatar;
+        }
+        console.log('[IDENTITY] Restored', socket.id, '→', account.username, `(${account.userId})`);
+      } else {
+        console.log('[IDENTITY] Token invalid/unknown — treating as fresh registration');
       }
     }
 
+    // Path B: fresh registration (no token, or invalid token)
+    if (!account) {
+      if (!rawUsername || rawUsername.length < 3) {
+        socket.emit('identityError', { message: 'Invalid identity data' });
+        return;
+      }
+
+      const userId = generateUserId();
+      const token = generateToken();
+      const normalized = normalizeUsername(rawUsername);
+      if (!normalized || normalized.length < 3) {
+        socket.emit('identityError', { message: 'Invalid username' });
+        return;
+      }
+      const finalUsername = generateUniqueUsername(normalized, userId);
+      const avatar = incomingAvatar || '🤖';
+
+      account = {
+        userId,
+        token,
+        username: finalUsername,
+        avatar,
+        createdAt: Date.now(),
+      };
+
+      userAccounts.set(token, {
+        userId,
+        username: finalUsername,
+        avatar,
+        createdAt: account.createdAt,
+      });
+      accountsByUserId.set(userId, {
+        token,
+        username: finalUsername,
+        avatar,
+        createdAt: account.createdAt,
+      });
+
+      console.log('[IDENTITY] Fresh', socket.id, '→', finalUsername, `(${userId})`);
+    }
+
+    // ─── Session replacement: same userId already connected elsewhere ───
+    for (const [existingSocketId, existingPlayer] of onlinePlayers) {
+      if (existingPlayer.userId === account.userId && existingSocketId !== socket.id) {
+        console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${account.userId})`);
+        io.to(existingSocketId).emit('sessionReplaced', {
+          reason: 'logged-in-elsewhere',
+        });
+        const oldSocket = io.sockets.sockets.get(existingSocketId);
+        if (oldSocket) {
+          // Give the emit a tick to flush, then kill the ghost socket
+          setTimeout(() => {
+            try { oldSocket.disconnect(true); } catch {}
+          }, 50);
+        }
+      }
+    }
+
+    // ─── Populate players + onlinePlayers for THIS socket ───
     const player = players.get(socket.id);
     if (player) {
-      player.name = username;
-      player.username = normalizeUsername(username);
-      player.userId = userId;
+      player.name = account.username;
+      player.username = account.username;
+      player.userId = account.userId;
+      player.token = account.token;
+      player.avatar = account.avatar;
     }
 
     onlinePlayers.set(socket.id, {
-      userId,
-      name: username,
-      username: normalizeUsername(username),
-      avatar,
+      userId: account.userId,
+      name: account.username,
+      username: account.username,
+      avatar: account.avatar,
       status: 'online',
       socketId: socket.id,
+      token: account.token,
       connectedAt: Date.now(),
     });
 
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    const existingStats = playerStats.get(userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
+    const existingStats = playerStats.get(account.userId) || { wins: 0, losses: 0, ties: 0, total: 0 };
     socket.emit('playerStats', { stats: existingStats });
 
-    console.log('[IDENTITY]', socket.id, '→', username, `(${userId})`);
+    socket.emit('identityRegistered', {
+      userId: account.userId,
+      token: account.token,
+      username: account.username,
+      avatar: account.avatar,
+    });
   });
 
+  // ────────────────────────────────────────────────────────────
+  // changeUsername — token identifies the caller.
+  // Payload: { newUsername }
+  // ────────────────────────────────────────────────────────────
   socket.on('changeUsername', (data) => {
-    const newUsername = (data.newUsername || '').trim().slice(0, 15);
-    const userId = (data.userId || '').trim();
+    const newUsername = (data?.newUsername || '').trim().slice(0, 15);
 
-    if (!userId || newUsername.length < 3) {
+    const player = players.get(socket.id);
+    const token = player?.token;
+    const account = token ? userAccounts.get(token) : null;
+
+    if (!account) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'Not authenticated',
+      });
+      return;
+    }
+
+    if (newUsername.length < 3) {
       socket.emit('changeUsernameResult', {
         success: false,
         message: 'Username must be at least 3 characters',
@@ -399,16 +540,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    let taken = false;
-    for (const [socketId, player] of onlinePlayers) {
-      if (socketId === socket.id) continue;
-      if (player.username === normalized) {
-        taken = true;
-        break;
-      }
-    }
-
-    if (taken) {
+    if (normalized !== account.username && !isUsernameAvailable(normalized, account.userId)) {
       socket.emit('changeUsernameResult', {
         success: false,
         message: 'That username is already taken',
@@ -416,16 +548,20 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const player = players.get(socket.id);
+    // Update account
+    account.username = normalized;
+    const byId = accountsByUserId.get(account.userId);
+    if (byId) byId.username = normalized;
+
+    // Update live player entries
     if (player) {
       player.name = newUsername;
       player.username = normalized;
     }
-
-    if (onlinePlayers.has(socket.id)) {
-      const entry = onlinePlayers.get(socket.id);
-      entry.name = newUsername;
-      entry.username = normalized;
+    const onlineEntry = onlinePlayers.get(socket.id);
+    if (onlineEntry) {
+      onlineEntry.name = newUsername;
+      onlineEntry.username = normalized;
     }
 
     broadcastOnlineUsers();
@@ -439,10 +575,14 @@ io.on('connection', (socket) => {
     console.log('[CHANGE USERNAME]', socket.id, '→', newUsername);
   });
 
+  // ────────────────────────────────────────────────────────────
+  // deleteAccount — token identifies the caller.
+  // ────────────────────────────────────────────────────────────
   socket.on('deleteAccount', () => {
     console.log('[DELETE ACCOUNT]', socket.id);
 
     const player = players.get(socket.id);
+    const token = player?.token || onlinePlayers.get(socket.id)?.token;
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
 
     if (player && player.room) {
@@ -455,7 +595,9 @@ io.on('connection', (socket) => {
 
     players.delete(socket.id);
 
+    if (token) userAccounts.delete(token);
     if (userId) {
+      accountsByUserId.delete(userId);
       matchHistory.delete(userId);
       playerStats.delete(userId);
     }
