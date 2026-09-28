@@ -6,9 +6,12 @@
 //         match-screen presence, roomReady, recentMoves, match history.
 // Chat 2: adaptive AI engine wired into Avatar Arena, per-mode stats,
 //         overall streaks, pull-based leaderboard.
-// Chat 4 (this file): persistent state migrated from in-memory Maps to
-//         Supabase. Auth flow, event names, and payload shapes are
-//         UNCHANGED — only the storage backing moved.
+// Chat 4: persistent state migrated from in-memory Maps to Supabase.
+//         Auth flow, event names, and payload shapes UNCHANGED.
+// Chat 5: Dojo stats sync (roadmap item #2). New socket event
+//         `recordDojoMatch` writes dojo W/L/T + overall W/L/T + streaks
+//         to Supabase and inserts a match_history row with mode 'dojo'.
+//         Does NOT touch human/avatar per-mode stats. db.js unchanged.
 //
 // Persistent (Supabase via db.js):
 //   users, auth_tokens, player_stats, match_history
@@ -19,11 +22,6 @@
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
 //   INVITE_TIMEOUT = 5 min.
-//
-// Preserved behavior: registerIdentity / sessionReplaced / changeUsername /
-//   deleteAccount, setPlayerStatus + enterMatchScreen / leaveMatchScreen,
-//   roomReady, recentMoves, searchPlayer, online broadcasts, avatar AI,
-//   dojo stats default to 0 (dojo sync is roadmap item #2).
 
 const express = require('express');
 const http = require('http');
@@ -79,8 +77,6 @@ function normalizeUsername(name) {
 }
 
 // Username uniqueness scans BOTH live players AND stored accounts.
-// Live players are checked synchronously (in-memory). Stored accounts
-// are checked via db.isUsernameAvailable (async).
 async function isUsernameAvailable(name, exceptUserId) {
   const normalized = normalizeUsername(name);
   if (!normalized) return false;
@@ -202,7 +198,6 @@ function broadcastOnlineCount() {
   io.emit('onlineCount', { count: onlinePlayers.size });
 }
 
-// Bulk reset remaining players to 'online' (used when someone leaves a room)
 function resetPlayersToOnline(room) {
   if (!room) return;
   let changed = false;
@@ -270,8 +265,8 @@ function clearAvatarAI(room) {
   room.aiState = null;
 }
 
-// ─── Match result recording ───
-// Async now — writes to Supabase, then emits fresh stats to both sockets.
+// ─── Match result recording (human / avatar rooms) ───
+// Async — writes to Supabase, then emits fresh stats to both sockets.
 // Errors are caught and logged; they never crash the process or block the
 // roundResult emit (which is emitted by the caller separately).
 async function recordMatchResult(room) {
@@ -380,6 +375,88 @@ async function recordMatchResult(room) {
   io.to(p2).emit('playerStats', { stats: p2Stats });
 
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name, `(${mode})`);
+}
+
+// ─── Dojo match recording (Chat 5 — roadmap item #2) ───
+// Called directly from the `recordDojoMatch` socket event. Dojo matches
+// are single-player vs. an AI master, so there is no room and no opponent
+// socket — we only mutate the caller's stats and history.
+//
+// Payload:
+//   {
+//     result: 'win' | 'loss' | 'tie',
+//     opponentName: string,
+//     myScore: number, opponentScore: number,
+//     myTies: number, opponentTies: number,
+//     rounds: number
+//   }
+//
+// Rules:
+//   - Only dojoWins/Losses/Ties + overall wins/losses/ties/total + streaks
+//     are mutated. human*/avatar* per-mode stats are untouched.
+//   - `total` matches recordMatchResult: wins + losses (ties excluded).
+//   - currentStreak: win → +1, loss → 0, tie → unchanged.
+//   - bestStreak = max(bestStreak, currentStreak).
+//   - Ties per side are NOT persisted (match_history has no columns for
+//     them, and we're not changing schema in this chat).
+async function recordDojoMatchResult(userId, payload) {
+  if (!userId) return null;
+
+  const result = payload?.result;
+  if (result !== 'win' && result !== 'loss' && result !== 'tie') {
+    return null;
+  }
+
+  const opponentName = String(payload?.opponentName || 'Master').slice(0, 40);
+  const myScore = Math.max(0, Math.min(9999, Math.floor(Number(payload?.myScore) || 0)));
+  const opponentScore = Math.max(0, Math.min(9999, Math.floor(Number(payload?.opponentScore) || 0)));
+  const rounds = Math.max(0, Math.min(9999, Math.floor(Number(payload?.rounds) || 0)));
+  const timestamp = Date.now();
+
+  // ── History ──
+  await db.appendMatch(userId, {
+    mode: 'dojo',
+    opponent: opponentName,
+    opponentId: null,
+    result,
+    myScore,
+    theirScore: opponentScore,
+    rounds,
+    timestamp,
+  });
+
+  // ── Stats ──
+  const stats = await db.getOrCreateStats(userId);
+
+  if (result === 'win') {
+    stats.wins++;
+    stats.dojoWins++;
+    stats.currentStreak = (stats.currentStreak || 0) + 1;
+    if (stats.currentStreak > (stats.bestStreak || 0)) {
+      stats.bestStreak = stats.currentStreak;
+    }
+  } else if (result === 'loss') {
+    stats.losses++;
+    stats.dojoLosses++;
+    stats.currentStreak = 0;
+  } else {
+    // tie
+    stats.ties++;
+    stats.dojoTies++;
+    // currentStreak unchanged on tie (mirrors recordMatchResult, which
+    // has no tie branch at all).
+  }
+
+  stats.total = stats.wins + stats.losses;
+
+  await db.saveStats(userId, stats);
+
+  console.log(
+    '[DOJO RECORDED]', userId, 'vs', opponentName,
+    '→', result, `(${myScore}-${opponentScore}, ${rounds} rounds)`,
+  );
+
+  return stats;
 }
 
 // ─── Leaderboard ───
@@ -491,7 +568,6 @@ function startAvatarAutoPlay(roomCode) {
     if (matchWinner) {
       r.matchOver = true;
       r.winner = matchWinner;
-      // Fire and forget — recordMatchResult emits playerStats itself.
       recordMatchResult(r).catch((e) =>
         console.error('[MATCH RECORD ERROR]', e?.message)
       );
@@ -552,7 +628,6 @@ io.on('connection', (socket) => {
       if (found) {
         account = { ...found };
 
-        // Optional username update (same rules as before)
         if (rawUsername && rawUsername.length >= 3) {
           const normalized = normalizeUsername(rawUsername);
           if (
@@ -565,7 +640,6 @@ io.on('connection', (socket) => {
           }
         }
 
-        // Optional avatar update
         if (incomingAvatar && incomingAvatar !== account.avatar) {
           await db.updateAvatar(account.userId, incomingAvatar);
           account.avatar = incomingAvatar;
@@ -611,7 +685,7 @@ io.on('connection', (socket) => {
       console.log('[IDENTITY] Fresh', socket.id, '→', finalUsername, `(${userId})`);
     }
 
-    // ─── Session replacement: same userId already connected elsewhere ───
+    // ─── Session replacement ───
     for (const [existingSocketId, existingPlayer] of onlinePlayers) {
       if (existingPlayer.userId === account.userId && existingSocketId !== socket.id) {
         console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${account.userId})`);
@@ -664,7 +738,6 @@ io.on('connection', (socket) => {
 
   // ────────────────────────────────────────────────────────────
   // changeUsername — token identifies the caller.
-  // Payload: { newUsername }
   // ────────────────────────────────────────────────────────────
   socket.on('changeUsername', async (data) => {
     const newUsername = (data?.newUsername || '').trim().slice(0, 15);
@@ -715,8 +788,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Persist — db layer enforces uniqueness via the unique index, so a
-    // race that slipped past the pre-check will surface here as false.
     const ok = await db.updateUsername(account.userId, normalized);
     if (!ok) {
       socket.emit('changeUsernameResult', {
@@ -726,7 +797,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Update live player entries (display keeps raw form, key stays normalized)
     if (player) {
       player.name = newUsername;
       player.username = normalized;
@@ -802,6 +872,36 @@ io.on('connection', (socket) => {
     }
     const stats = await db.getOrCreateStats(userId);
     socket.emit('playerStats', { stats });
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // recordDojoMatch  (Chat 5 — roadmap item #2)
+  // Payload: {
+  //   result: 'win' | 'loss' | 'tie',
+  //   opponentName, myScore, opponentScore,
+  //   myTies, opponentTies, rounds
+  // }
+  // Caller is authenticated via the socket's registered userId.
+  // Emits updated playerStats back to this socket on success.
+  // ────────────────────────────────────────────────────────────
+  socket.on('recordDojoMatch', async (data) => {
+    const player = players.get(socket.id);
+    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+
+    if (!userId) {
+      // Not registered — silently ignore (matches other auth guards).
+      console.log('[DOJO RECORD] Unauthenticated socket, ignored:', socket.id);
+      return;
+    }
+
+    try {
+      const updated = await recordDojoMatchResult(userId, data);
+      if (updated) {
+        socket.emit('playerStats', { stats: updated });
+      }
+    } catch (e) {
+      console.error('[DOJO RECORD ERROR]', e?.message);
+    }
   });
 
   // ─── Pull-based leaderboard ───
