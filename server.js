@@ -11,10 +11,17 @@
 // Chat 5: Dojo stats sync (roadmap item #2). New socket event
 //         `recordDojoMatch` writes dojo W/L/T + overall W/L/T + streaks
 //         to Supabase and inserts a match_history row with mode 'dojo'.
-//         Does NOT touch human/avatar per-mode stats. db.js unchanged.
+//         Does NOT touch human/avatar per-mode stats.
+// Chat 7: Achievements (roadmap item #4). After every recorded match
+//         (human / avatar / dojo), db.checkAchievements() runs and any
+//         newly-unlocked achievements are pushed to the player's socket
+//         as 'achievementUnlocked'. Two new pull events added:
+//         getAchievements, getAchievementCatalog.
+//         Match recording now also updates the Chat 7 tracking fields
+//         (opponentsPlayed, dailyWinDates, masterWins).
 //
 // Persistent (Supabase via db.js):
-//   users, auth_tokens, player_stats, match_history
+//   users, auth_tokens, player_stats, match_history, achievements
 //
 // Ephemeral (still in-memory, intentionally):
 //   rooms, players, onlinePlayers, activeInvites, recentOpponents
@@ -265,10 +272,74 @@ function clearAvatarAI(room) {
   room.aiState = null;
 }
 
+// ─── Achievement emission helper (Chat 7) ───
+// Given a socketId and the array of catalog entries returned by
+// db.checkAchievements, emit one 'achievementUnlocked' event per entry.
+// Client payload: { id, name, description, icon, category }.
+function emitAchievementsToSocket(socketId, unlocked) {
+  if (!socketId || !Array.isArray(unlocked) || unlocked.length === 0) return;
+  for (const a of unlocked) {
+    io.to(socketId).emit('achievementUnlocked', {
+      id: a.id,
+      name: a.name,
+      description: a.description,
+      icon: a.icon,
+      category: a.category,
+    });
+  }
+}
+
+// ─── Chat 7 tracking helpers ───
+// Mutate a stats object in place to reflect the tracking fields the
+// achievement rules depend on.
+
+// Add opponentId to opponentsPlayed if not already present.
+function trackOpponent(stats, opponentId) {
+  if (!stats || !opponentId) return;
+  if (!Array.isArray(stats.opponentsPlayed)) stats.opponentsPlayed = [];
+  if (!stats.opponentsPlayed.includes(opponentId)) {
+    stats.opponentsPlayed.push(opponentId);
+  }
+}
+
+// Append today's 'YYYY-MM-DD' to dailyWinDates if not already present.
+// Only called when the player won.
+function trackDailyWin(stats) {
+  if (!stats) return;
+  if (!Array.isArray(stats.dailyWinDates)) stats.dailyWinDates = [];
+  const key = db.dateKey(Date.now());
+  if (!stats.dailyWinDates.includes(key)) {
+    stats.dailyWinDates.push(key);
+  }
+}
+
+// Ensure masterWins exists with all four keys.
+function ensureMasterWins(stats) {
+  if (!stats) return;
+  if (!stats.masterWins || typeof stats.masterWins !== 'object') {
+    stats.masterWins = { rookie: 0, tactician: 0, hunter: 0, grandmaster: 0 };
+    return;
+  }
+  for (const k of ['rookie', 'tactician', 'hunter', 'grandmaster']) {
+    if (typeof stats.masterWins[k] !== 'number') stats.masterWins[k] = 0;
+  }
+}
+
+// Increment masterWins[masterId] by 1.
+function trackMasterWin(stats, masterId) {
+  if (!stats || !masterId) return;
+  ensureMasterWins(stats);
+  stats.masterWins[masterId] = (stats.masterWins[masterId] || 0) + 1;
+}
+
 // ─── Match result recording (human / avatar rooms) ───
 // Async — writes to Supabase, then emits fresh stats to both sockets.
 // Errors are caught and logged; they never crash the process or block the
 // roundResult emit (which is emitted by the caller separately).
+//
+// Chat 7: also updates opponentsPlayed (both players, mutual) and
+// dailyWinDates (winner only), then runs checkAchievements for both
+// users and emits 'achievementUnlocked' for any fresh unlocks.
 async function recordMatchResult(room) {
   if (!room || !room.winner) return;
 
@@ -331,6 +402,11 @@ async function recordMatchResult(room) {
     if (p1Won) p1Stats.dojoWins++;
     else p1Stats.dojoLosses++;
   }
+
+  // Chat 7 tracking
+  trackOpponent(p1Stats, p2UserId);
+  if (p1Won) trackDailyWin(p1Stats);
+
   await db.saveStats(p1UserId, p1Stats);
 
   // ── P2: history ──
@@ -369,12 +445,34 @@ async function recordMatchResult(room) {
     if (p2Won) p2Stats.dojoWins++;
     else p2Stats.dojoLosses++;
   }
+
+  // Chat 7 tracking
+  trackOpponent(p2Stats, p1UserId);
+  if (p2Won) trackDailyWin(p2Stats);
+
   await db.saveStats(p2UserId, p2Stats);
 
   io.to(p1).emit('playerStats', { stats: p1Stats });
   io.to(p2).emit('playerStats', { stats: p2Stats });
 
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name, `(${mode})`);
+
+  // ── Chat 7: achievements for both players ──
+  // Non-blocking — any failure is logged and swallowed so a broken
+  // achievement rule never affects match recording.
+  try {
+    const p1Unlocked = await db.checkAchievements(p1UserId);
+    emitAchievementsToSocket(p1, p1Unlocked);
+  } catch (e) {
+    console.error('[ACHIEVEMENTS] P1 check failed:', e?.message || e);
+  }
+
+  try {
+    const p2Unlocked = await db.checkAchievements(p2UserId);
+    emitAchievementsToSocket(p2, p2Unlocked);
+  } catch (e) {
+    console.error('[ACHIEVEMENTS] P2 check failed:', e?.message || e);
+  }
 }
 
 // ─── Dojo match recording (Chat 5 — roadmap item #2) ───
@@ -398,7 +496,14 @@ async function recordMatchResult(room) {
 //   - currentStreak: win → +1, loss → 0, tie → unchanged.
 //   - bestStreak = max(bestStreak, currentStreak).
 //   - Ties per side are NOT persisted (match_history has no columns for
-//     them, and we're not changing schema in this chat).
+//     them).
+//
+// Chat 7 additions:
+//   - On a win, append today's date to dailyWinDates.
+//   - On a win, if the opponentName maps to one of the four master ids,
+//     increment masterWins[masterId].
+//   - After saving stats, run checkAchievements and return the fresh
+//     unlocks alongside the stats so the caller can emit them.
 async function recordDojoMatchResult(userId, payload) {
   if (!userId) return null;
 
@@ -449,6 +554,13 @@ async function recordDojoMatchResult(userId, payload) {
 
   stats.total = stats.wins + stats.losses;
 
+  // Chat 7 tracking
+  if (result === 'win') {
+    trackDailyWin(stats);
+    const masterId = db.resolveMasterId(opponentName);
+    if (masterId) trackMasterWin(stats, masterId);
+  }
+
   await db.saveStats(userId, stats);
 
   console.log(
@@ -456,7 +568,15 @@ async function recordDojoMatchResult(userId, payload) {
     '→', result, `(${myScore}-${opponentScore}, ${rounds} rounds)`,
   );
 
-  return stats;
+  // Chat 7: run achievement check for this user.
+  let unlocked = [];
+  try {
+    unlocked = await db.checkAchievements(userId);
+  } catch (e) {
+    console.error('[ACHIEVEMENTS] dojo check failed:', e?.message || e);
+  }
+
+  return { stats, unlocked };
 }
 
 // ─── Leaderboard ───
@@ -883,6 +1003,9 @@ io.on('connection', (socket) => {
   // }
   // Caller is authenticated via the socket's registered userId.
   // Emits updated playerStats back to this socket on success.
+  //
+  // Chat 7: also emits 'achievementUnlocked' for any fresh unlocks
+  // returned by recordDojoMatchResult.
   // ────────────────────────────────────────────────────────────
   socket.on('recordDojoMatch', async (data) => {
     const player = players.get(socket.id);
@@ -895,13 +1018,46 @@ io.on('connection', (socket) => {
     }
 
     try {
-      const updated = await recordDojoMatchResult(userId, data);
-      if (updated) {
-        socket.emit('playerStats', { stats: updated });
+      const result = await recordDojoMatchResult(userId, data);
+      if (result) {
+        socket.emit('playerStats', { stats: result.stats });
+        emitAchievementsToSocket(socket.id, result.unlocked);
       }
     } catch (e) {
       console.error('[DOJO RECORD ERROR]', e?.message);
     }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // getAchievements  (Chat 7 — roadmap item #4)
+  // Returns { unlocked: { [achievementId]: unlockedAt } } for the
+  // caller. Unauthenticated sockets get an empty map.
+  // ────────────────────────────────────────────────────────────
+  socket.on('getAchievements', async () => {
+    const player = players.get(socket.id);
+    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+
+    if (!userId) {
+      socket.emit('achievements', { unlocked: {} });
+      return;
+    }
+
+    try {
+      const unlocked = await db.getUnlockedMap(userId);
+      socket.emit('achievements', { unlocked });
+    } catch (e) {
+      console.error('[ACHIEVEMENTS] getAchievements failed:', e?.message);
+      socket.emit('achievements', { unlocked: {} });
+    }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // getAchievementCatalog  (Chat 7 — roadmap item #4)
+  // Returns { catalog: ACHIEVEMENT_CATALOG }. No auth required —
+  // the catalog is public static data.
+  // ────────────────────────────────────────────────────────────
+  socket.on('getAchievementCatalog', () => {
+    socket.emit('achievementCatalog', { catalog: db.ACHIEVEMENT_CATALOG });
   });
 
   // ─── Pull-based leaderboard ───

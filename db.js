@@ -1,12 +1,25 @@
 // rps-server/db.js
 //
-// RPS Arena — Supabase persistence layer (Chat 4, roadmap item #1).
+// RPS Arena — Supabase persistence layer.
 //
-// Replaces the four in-memory Maps that used to live in server.js:
+// Chat 4: replaces the four in-memory Maps that used to live in server.js:
 //   userAccounts      → users + auth_tokens
 //   accountsByUserId  → users + auth_tokens
 //   playerStats       → player_stats
 //   matchHistory      → match_history
+//
+// Chat 7: achievements (roadmap item #4).
+//   - New table `achievements` (userId, achievementId, unlockedAt).
+//   - New player_stats columns: opponentsPlayed text[], dailyWinDates
+//     text[], masterWins jsonb.
+//   - ACHIEVEMENT_CATALOG constant: the 25-item catalog (id, name,
+//     description, icon, category, rule).
+//   - checkAchievements(userId): evaluate all 25 rules against the
+//     user's stats and insert any new unlocks. Returns the full catalog
+//     entries for the achievements that were newly unlocked so the
+//     caller can emit them to the client.
+//   - resolveMasterId(name): map a dojo opponent display name to one of
+//     the four master ids used by masterWins / the dojo achievements.
 //
 // Every helper returns the SAME shape the old in-memory code produced,
 // so server.js reads almost identically. All helpers are async.
@@ -37,6 +50,11 @@ const MAX_HISTORY = 20;
 // ────────────────────────────────────────────────────────────
 // Stats shape — mirrors createEmptyStats() in server.js exactly.
 // Central factory so the empty object is identical everywhere.
+//
+// Chat 7 added three tracking fields used by the achievement rules:
+//   opponentsPlayed — unique opponent userIds (social / rematch rules)
+//   dailyWinDates   — 'YYYY-MM-DD' of each day with ≥1 win (perfect_week)
+//   masterWins      — per-master win counts (dojo-special rules)
 // ────────────────────────────────────────────────────────────
 function createEmptyStats() {
   return {
@@ -55,20 +73,56 @@ function createEmptyStats() {
     dojoTies: 0,
     currentStreak: 0,
     bestStreak: 0,
+    // Chat 7 tracking
+    opponentsPlayed: [],
+    dailyWinDates: [],
+    masterWins: { rookie: 0, tactician: 0, hunter: 0, grandmaster: 0 },
   };
 }
 
-// Convert a DB row (snake-free, PascalCase keys) → stats object.
-// DB columns match createEmptyStats() exactly, so this is a shallow copy
-// with the userId stripped.
+// Shape used when a masterWins column is missing or malformed.
+function emptyMasterWins() {
+  return { rookie: 0, tactician: 0, hunter: 0, grandmaster: 0 };
+}
+
+// Convert a DB row → stats object.
+// Numeric fields are copied by name; the three Chat 7 fields are
+// sanitized so a NULL / missing column never crashes callers.
 function rowToStats(row) {
   if (!row) return createEmptyStats();
-  const { userId, ...stats } = row;
-  // Guard against nulls just in case (shouldn't happen — schema has defaults).
+
   const out = createEmptyStats();
+
   for (const k of Object.keys(out)) {
+    if (k === 'opponentsPlayed' || k === 'dailyWinDates' || k === 'masterWins') {
+      continue;
+    }
     if (typeof row[k] === 'number') out[k] = row[k];
   }
+
+  // Arrays: accept text[] or JSON array, else default to [].
+  if (Array.isArray(row.opponentsPlayed)) {
+    out.opponentsPlayed = row.opponentsPlayed.filter(
+      (v) => typeof v === 'string' && v.length > 0
+    );
+  }
+  if (Array.isArray(row.dailyWinDates)) {
+    out.dailyWinDates = row.dailyWinDates.filter(
+      (v) => typeof v === 'string' && v.length > 0
+    );
+  }
+
+  // masterWins: jsonb → object. Coerce each key to a non-negative int.
+  const mw = row.masterWins;
+  if (mw && typeof mw === 'object' && !Array.isArray(mw)) {
+    const base = emptyMasterWins();
+    for (const key of Object.keys(base)) {
+      const v = Number(mw[key]);
+      base[key] = Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+    }
+    out.masterWins = base;
+  }
+
   return out;
 }
 
@@ -192,9 +246,16 @@ async function createUser({ userId, token, username, avatar, createdAt }) {
   }
 
   // Seed a stats row so leaderboard queries see the user immediately.
+  // Chat 7: also seed the tracking columns explicitly so they exist
+  // from row one (schema defaults cover this too — belt and braces).
   const { error: statsErr } = await supabase
     .from('player_stats')
-    .insert({ userId });
+    .insert({
+      userId,
+      opponentsPlayed: [],
+      dailyWinDates: [],
+      masterWins: emptyMasterWins(),
+    });
 
   if (statsErr) {
     // Non-fatal: getOrCreateStats() will create it lazily. Log and move on.
@@ -242,7 +303,8 @@ async function updateAvatar(userId, avatar) {
   return true;
 }
 
-// Deletes the user. FK ON DELETE CASCADE removes tokens, stats, history.
+// Deletes the user. FK ON DELETE CASCADE removes tokens, stats, history,
+// and achievement unlocks.
 // Returns true on success.
 async function deleteUser(userId) {
   if (!userId) return false;
@@ -306,13 +368,32 @@ async function getOrCreateStats(userId) {
 
 // Persist a full stats object. Caller mutates a local copy then writes
 // it back with this function — mirrors the old playerStats.set() pattern.
+//
+// Chat 7: the three tracking fields ride along on the same upsert. They
+// are plain JS values that Supabase serializes to text[] / jsonb.
 async function saveStats(userId, stats) {
   if (!userId) return false;
+
+  const safe = stats && typeof stats === 'object' ? stats : {};
 
   const { error } = await supabase
     .from('player_stats')
     .upsert(
-      { userId, ...stats },
+      {
+        userId,
+        ...safe,
+        // Defensive: never write undefined/null into these columns.
+        opponentsPlayed: Array.isArray(safe.opponentsPlayed)
+          ? safe.opponentsPlayed
+          : [],
+        dailyWinDates: Array.isArray(safe.dailyWinDates)
+          ? safe.dailyWinDates
+          : [],
+        masterWins:
+          safe.masterWins && typeof safe.masterWins === 'object'
+            ? safe.masterWins
+            : emptyMasterWins(),
+      },
       { onConflict: 'userId' }
     );
 
@@ -448,6 +529,275 @@ async function listStatsWithUsers() {
 }
 
 // ────────────────────────────────────────────────────────────
+// ACHIEVEMENTS (Chat 7 — roadmap item #4)
+// ────────────────────────────────────────────────────────────
+
+// The full 25-item catalog. Keep ids stable — they are the primary key
+// half in the achievements table. `rule` is a human-readable string for
+// the client; the actual evaluation lives in checkAchievements().
+//
+// Category strings are used by the client to group badges.
+//   progression | streaks | mode | dojo | volume | social
+const ACHIEVEMENT_CATALOG = [
+  // ── Progression (5) ──
+  { id: 'first_win',         name: 'First Win',         icon: '🥇', category: 'progression', rule: 'wins >= 1',            description: 'Win your first match.' },
+  { id: 'ten_wins',          name: 'Getting Started',   icon: '🎯', category: 'progression', rule: 'wins >= 10',           description: 'Win 10 matches.' },
+  { id: 'fifty_wins',        name: 'Half Century',      icon: '🏅', category: 'progression', rule: 'wins >= 50',           description: 'Win 50 matches.' },
+  { id: 'hundred_wins',      name: 'Century Club',      icon: '💯', category: 'progression', rule: 'wins >= 100',          description: 'Win 100 matches.' },
+  { id: 'five_hundred_wins', name: 'Legend',            icon: '👑', category: 'progression', rule: 'wins >= 500',          description: 'Win 500 matches.' },
+
+  // ── Streaks (4) ──
+  { id: 'streak_5',          name: 'On Fire',           icon: '🔥', category: 'streaks',     rule: 'bestStreak >= 5',      description: 'Win 5 matches in a row.' },
+  { id: 'streak_10',         name: 'Unstoppable',       icon: '⚡', category: 'streaks',     rule: 'bestStreak >= 10',     description: 'Win 10 matches in a row.' },
+  { id: 'streak_20',         name: 'Immortal',          icon: '♾️', category: 'streaks',     rule: 'bestStreak >= 20',     description: 'Win 20 matches in a row.' },
+  { id: 'perfect_week',      name: 'Perfect Week',      icon: '📅', category: 'streaks',     rule: 'won a match 7 days in a row', description: 'Win at least one match every day for 7 days.' },
+
+  // ── Mode Mastery (6) ──
+  { id: 'human_champ',       name: "People's Champion", icon: '👥', category: 'mode',        rule: 'humanWins >= 10',      description: 'Win 10 Human vs Human matches.' },
+  { id: 'avatar_champ',      name: 'Arena Champion',    icon: '🎭', category: 'mode',        rule: 'avatarWins >= 10',     description: 'Win 10 Avatar Arena matches.' },
+  { id: 'dojo_master',       name: 'Dojo Master',       icon: '🥋', category: 'mode',        rule: 'dojoWins >= 10',       description: 'Win 10 AI Dojo matches.' },
+  { id: 'all_rounder',       name: 'All-Rounder',       icon: '🎲', category: 'mode',        rule: 'won at least 1 in each mode (human, avatar, dojo)', description: 'Win at least one match in every mode.' },
+  { id: 'mode_specialist',   name: 'Mode Specialist',   icon: '🎪', category: 'mode',        rule: '100 wins in any single mode', description: 'Win 100 matches in a single mode.' },
+  { id: 'jack_of_all_trades',name: 'Jack of All Trades',icon: '🃏', category: 'mode',        rule: '50 wins in each mode', description: 'Win 50 matches in every mode.' },
+
+  // ── Dojo Specials (4) ──
+  { id: 'grandmaster_slayer',name: 'Grandmaster Slayer',icon: '🐉', category: 'dojo',        rule: 'beat Grandmaster at least once', description: 'Defeat the Grandmaster.' },
+  { id: 'dojo_sweeper',      name: 'Dojo Sweeper',      icon: '🧹', category: 'dojo',        rule: 'beat all 4 masters (Rookie, Tactician, Hunter, Grandmaster)', description: 'Defeat every dojo master at least once.' },
+  { id: 'rookie_killer',     name: 'Rookie Killer',     icon: '🐣', category: 'dojo',        rule: 'beat Rookie 10 times', description: 'Defeat the Rookie 10 times.' },
+  { id: 'hunter_survivor',   name: 'Hunter Survivor',   icon: '🏹', category: 'dojo',        rule: 'beat Hunter 5 times',  description: 'Defeat the Hunter 5 times.' },
+
+  // ── Volume (3) ──
+  { id: 'veteran',           name: 'Veteran',           icon: '🎖️', category: 'volume',      rule: 'total matches >= 100', description: 'Play 100 matches.' },
+  { id: 'grinder',           name: 'Grinder',           icon: '⚙️', category: 'volume',      rule: 'total matches >= 500', description: 'Play 500 matches.' },
+  { id: 'addict',            name: 'Addict',            icon: '🧠', category: 'volume',      rule: 'total matches >= 1000',description: 'Play 1000 matches.' },
+
+  // ── Social (3) ──
+  { id: 'social_5',          name: 'Getting Social',    icon: '🤝', category: 'social',      rule: 'played vs 5 unique opponents', description: 'Play against 5 different opponents.' },
+  { id: 'social_25',         name: 'Well-Connected',    icon: '🌐', category: 'social',      rule: 'played vs 25 unique opponents', description: 'Play against 25 different opponents.' },
+  { id: 'rematch_king',      name: 'Rematch King',      icon: '🔁', category: 'social',      rule: 'played 10 rematches',  description: 'Play 10 rematches.' },
+];
+
+// Fast lookup by id.
+const ACHIEVEMENT_BY_ID = Object.fromEntries(
+  ACHIEVEMENT_CATALOG.map((a) => [a.id, a])
+);
+
+// Master ids recognized by masterWins + the dojo achievements.
+const MASTER_IDS = ['rookie', 'tactician', 'hunter', 'grandmaster'];
+
+// Map a dojo opponent display name ("Rookie", "The Grandmaster",
+// "Master Hunter", …) to a master id. Case-insensitive substring match
+// so small display-name variations don't break the rule.
+// Returns null if nothing matches (in which case masterWins is untouched).
+function resolveMasterId(name) {
+  if (!name || typeof name !== 'string') return null;
+  const lower = name.toLowerCase();
+  for (const id of MASTER_IDS) {
+    if (lower.includes(id)) return id;
+  }
+  return null;
+}
+
+// Local helper — 'YYYY-MM-DD' for a timestamp (local server time).
+function dateKey(ts) {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Does dailyWinDates contain 7 consecutive calendar days ending anywhere
+// in the array? Cheap: sort unique dates, then scan for a run of 7.
+function hasSevenDayWinStreak(dates) {
+  if (!Array.isArray(dates) || dates.length < 7) return false;
+
+  const unique = Array.from(new Set(dates.filter((d) => typeof d === 'string' && d)));
+  if (unique.length < 7) return false;
+
+  const ms = unique
+    .map((s) => {
+      const [y, m, d] = s.split('-').map((n) => parseInt(n, 10));
+      if (!y || !m || !d) return NaN;
+      return Date.UTC(y, m - 1, d);
+    })
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
+
+  const DAY = 24 * 60 * 60 * 1000;
+  let run = 1;
+  for (let i = 1; i < ms.length; i++) {
+    if (ms[i] - ms[i - 1] === DAY) {
+      run++;
+      if (run >= 7) return true;
+    } else if (ms[i] !== ms[i - 1]) {
+      run = 1;
+    }
+  }
+  return false;
+}
+
+// Count how many opponents have been faced more than once.
+// opponentsPlayed is a *unique* list, so we can't count rematches from
+// it alone. We approximate: rematch_king is satisfied when the user has
+// played at least 10 more total matches than unique opponents, i.e.
+// total - opponentsPlayed.length >= 10. This is intentionally simple;
+// see the "fix later" note about switching to a real rematch counter.
+function rematchCountApprox(stats) {
+  const unique = Array.isArray(stats.opponentsPlayed)
+    ? stats.opponentsPlayed.length
+    : 0;
+  const totalMatches = (stats.total || 0) + (stats.ties || 0);
+  const diff = totalMatches - unique;
+  return diff > 0 ? diff : 0;
+}
+
+// Evaluate every rule against a stats object.
+// Returns the subset of catalog entries whose rules are satisfied.
+// Pure — no DB access. checkAchievements() handles persistence.
+function evaluateRules(stats) {
+  const s = stats || {};
+  const wins = s.wins || 0;
+  const totalMatches = (s.total || 0) + (s.ties || 0);
+  const bestStreak = s.bestStreak || 0;
+  const humanWins = s.humanWins || 0;
+  const avatarWins = s.avatarWins || 0;
+  const dojoWins = s.dojoWins || 0;
+
+  const masterWins = s.masterWins && typeof s.masterWins === 'object'
+    ? s.masterWins
+    : emptyMasterWins();
+
+  const uniqueOpponents = Array.isArray(s.opponentsPlayed)
+    ? s.opponentsPlayed.length
+    : 0;
+
+  const rematches = rematchCountApprox(s);
+
+  const modeWinCounts = [humanWins, avatarWins, dojoWins];
+  const maxModeWins = Math.max(...modeWinCounts, 0);
+  const minModeWins = Math.min(...modeWinCounts);
+
+  const rules = {
+    first_win:          wins >= 1,
+    ten_wins:           wins >= 10,
+    fifty_wins:         wins >= 50,
+    hundred_wins:       wins >= 100,
+    five_hundred_wins:  wins >= 500,
+
+    streak_5:           bestStreak >= 5,
+    streak_10:          bestStreak >= 10,
+    streak_20:          bestStreak >= 20,
+    perfect_week:       hasSevenDayWinStreak(s.dailyWinDates),
+
+    human_champ:        humanWins >= 10,
+    avatar_champ:       avatarWins >= 10,
+    dojo_master:        dojoWins >= 10,
+    all_rounder:        humanWins >= 1 && avatarWins >= 1 && dojoWins >= 1,
+    mode_specialist:    maxModeWins >= 100,
+    jack_of_all_trades: minModeWins >= 50,
+
+    grandmaster_slayer: (masterWins.grandmaster || 0) >= 1,
+    dojo_sweeper:
+      (masterWins.rookie || 0) >= 1 &&
+      (masterWins.tactician || 0) >= 1 &&
+      (masterWins.hunter || 0) >= 1 &&
+      (masterWins.grandmaster || 0) >= 1,
+    rookie_killer:      (masterWins.rookie || 0) >= 10,
+    hunter_survivor:    (masterWins.hunter || 0) >= 5,
+
+    veteran:            totalMatches >= 100,
+    grinder:            totalMatches >= 500,
+    addict:             totalMatches >= 1000,
+
+    social_5:           uniqueOpponents >= 5,
+    social_25:          uniqueOpponents >= 25,
+    rematch_king:       rematches >= 10,
+  };
+
+  return ACHIEVEMENT_CATALOG.filter((a) => rules[a.id]);
+}
+
+// Returns a map { achievementId: unlockedAt } for everything this user
+// has already unlocked. Empty object on error (caller treats as "none").
+async function getUnlockedMap(userId) {
+  if (!userId) return {};
+
+  const { data, error } = await supabase
+    .from('achievements')
+    .select('"achievementId", "unlockedAt"')
+    .eq('userId', userId);
+
+  if (error) {
+    console.error('[DB] getUnlockedMap error:', error.message);
+    return {};
+  }
+
+  const map = {};
+  for (const row of data || []) {
+    map[row.achievementId] = row.unlockedAt;
+  }
+  return map;
+}
+
+// Main entry. Reads the user's stats, evaluates all 25 rules, and
+// inserts any newly-satisfied achievements.
+//
+// Idempotent: the achievements table PK (userId, achievementId) plus
+// ON CONFLICT DO NOTHING means a re-run inserts nothing.
+//
+// Returns an ARRAY of catalog entries (id, name, description, icon,
+// category, rule) for the achievements unlocked by THIS call — empty
+// array if none. On any DB failure, returns [] and logs; it never
+// throws, so callers can fire-and-forget.
+async function checkAchievements(userId) {
+  if (!userId) return [];
+
+  try {
+    const stats = await getOrCreateStats(userId);
+    const satisfied = evaluateRules(stats);
+
+    if (satisfied.length === 0) return [];
+
+    const already = await getUnlockedMap(userId);
+    const fresh = satisfied.filter((a) => !already[a.id]);
+
+    if (fresh.length === 0) return [];
+
+    const now = Date.now();
+    const rows = fresh.map((a) => ({
+      userId,
+      achievementId: a.id,
+      unlockedAt: now,
+    }));
+
+    const { error } = await supabase
+      .from('achievements')
+      .upsert(rows, {
+        onConflict: 'userId,achievementId',
+        ignoreDuplicates: true,
+      });
+
+    if (error) {
+      console.error('[DB] checkAchievements insert error:', error.message);
+      return [];
+    }
+
+    console.log(
+      '[ACHIEVEMENTS]',
+      userId,
+      '→ unlocked:',
+      fresh.map((a) => a.id).join(', ')
+    );
+
+    return fresh;
+  } catch (e) {
+    console.error('[DB] checkAchievements error:', e?.message || e);
+    return [];
+  }
+}
+
+// ────────────────────────────────────────────────────────────
 // Exports
 // ────────────────────────────────────────────────────────────
 module.exports = {
@@ -473,4 +823,14 @@ module.exports = {
 
   // leaderboard
   listStatsWithUsers,
+
+  // achievements (Chat 7)
+  ACHIEVEMENT_CATALOG,
+  ACHIEVEMENT_BY_ID,
+  checkAchievements,
+  getUnlockedMap,
+  resolveMasterId,
+  dateKey,
+  // exported for potential client-side mirroring / tests
+  evaluateRules,
 };
