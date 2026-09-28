@@ -4,15 +4,26 @@
 //
 // Chat 1: server-issued auth tokens, session replacement, status tied to
 //         match-screen presence, roomReady, recentMoves, match history.
-// Chat 2 (this file): adaptive AI engine wired into Avatar Arena, per-mode
-//         stats, overall streaks, pull-based leaderboard.
+// Chat 2: adaptive AI engine wired into Avatar Arena, per-mode stats,
+//         overall streaks, pull-based leaderboard.
+// Chat 4 (this file): persistent state migrated from in-memory Maps to
+//         Supabase. Auth flow, event names, and payload shapes are
+//         UNCHANGED — only the storage backing moved.
 //
-// Preserved from Chat 1:
-//   - registerIdentity / sessionReplaced / changeUsername / deleteAccount
-//   - setPlayerStatus + enterMatchScreen / leaveMatchScreen
-//   - roomReady, recentMoves (5/player), AVATAR_ROUND_DELAY = 2000
-//   - match history (last 20 per userId), invites, searchPlayer
-//   - onlineUsers / onlineCount broadcasts
+// Persistent (Supabase via db.js):
+//   users, auth_tokens, player_stats, match_history
+//
+// Ephemeral (still in-memory, intentionally):
+//   rooms, players, onlinePlayers, activeInvites, recentOpponents
+//
+// Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
+//   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
+//   INVITE_TIMEOUT = 5 min.
+//
+// Preserved behavior: registerIdentity / sessionReplaced / changeUsername /
+//   deleteAccount, setPlayerStatus + enterMatchScreen / leaveMatchScreen,
+//   roomReady, recentMoves, searchPlayer, online broadcasts, avatar AI,
+//   dojo stats default to 0 (dojo sync is roadmap item #2).
 
 const express = require('express');
 const http = require('http');
@@ -20,6 +31,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { createAdaptiveAI } = require('./aiEngine');
+const db = require('./db');
 
 const app = express();
 app.use(cors());
@@ -29,59 +41,21 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// ─── In-memory state ───
+// ─── In-memory state (ephemeral — survives only while the process is up) ───
 const rooms = new Map();
 const players = new Map();          // socketId → { room, name, username, userId, token, avatar }
 const onlinePlayers = new Map();    // socketId → { userId, name, username, avatar, status, socketId, token, connectedAt }
 const activeInvites = new Map();
 const recentOpponents = new Map();
-const matchHistory = new Map();
-const playerStats = new Map();
 
-// ─── Auth (Tier 1, in-memory) ───
-const userAccounts = new Map();     // token    → { userId, username, avatar, createdAt }
-const accountsByUserId = new Map(); // userId   → { token,    username, avatar, createdAt }
-
+// ─── Constants ───
 const WIN_TARGET = 30;
 const DISCONNECT_TIMEOUT = 20000;
 const INVITE_TIMEOUT = 5 * 60 * 1000;
 const AVATAR_ROUND_DELAY = 2000;    // MUST stay 2000
-const MAX_HISTORY = 20;
 const MAX_RECENT_MOVES = 5;
 
-// ─── Stats schema ───
-// Central factory so every stats object has the same shape everywhere.
-function createEmptyStats() {
-  return {
-    wins: 0,
-    losses: 0,
-    ties: 0,
-    total: 0,
-    // per-mode
-    humanWins: 0,
-    humanLosses: 0,
-    humanTies: 0,
-    avatarWins: 0,
-    avatarLosses: 0,
-    avatarTies: 0,
-    dojoWins: 0,
-    dojoLosses: 0,
-    dojoTies: 0,
-    // streaks (overall, across all modes)
-    currentStreak: 0,
-    bestStreak: 0,
-  };
-}
-
-function getOrCreateStats(userId) {
-  if (!userId) return createEmptyStats();
-  let stats = playerStats.get(userId);
-  if (!stats) {
-    stats = createEmptyStats();
-    playerStats.set(userId, stats);
-  }
-  return stats;
-}
+// ─── Small helpers ───
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -104,9 +78,10 @@ function normalizeUsername(name) {
   return (name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
 }
 
-// Username uniqueness scans BOTH live players AND stored accounts,
-// so offline users keep their name reserved.
-function isUsernameAvailable(name, exceptUserId) {
+// Username uniqueness scans BOTH live players AND stored accounts.
+// Live players are checked synchronously (in-memory). Stored accounts
+// are checked via db.isUsernameAvailable (async).
+async function isUsernameAvailable(name, exceptUserId) {
   const normalized = normalizeUsername(name);
   if (!normalized) return false;
 
@@ -115,18 +90,15 @@ function isUsernameAvailable(name, exceptUserId) {
       return false;
     }
   }
-  for (const [userId, acc] of accountsByUserId) {
-    if (acc.username === normalized && userId !== exceptUserId) {
-      return false;
-    }
-  }
-  return true;
+
+  const dbFree = await db.isUsernameAvailable(normalized, exceptUserId);
+  return dbFree;
 }
 
-function generateUniqueUsername(baseName, exceptUserId) {
+async function generateUniqueUsername(baseName, exceptUserId) {
   let name = baseName;
   let counter = 1;
-  while (!isUsernameAvailable(name, exceptUserId)) {
+  while (!(await isUsernameAvailable(name, exceptUserId))) {
     name = `${baseName}${counter}`;
     counter++;
     if (counter > 100) {
@@ -269,9 +241,6 @@ function resolveRound(move1, move2) {
 }
 
 // ─── AI state setup ───
-// Called when a room has both players and battleMode === 'avatar'.
-// Creates one AdaptiveAI per player, seeded from each player's chosen
-// avatar personality. Also seeds room.avatarPersonalities.
 function ensureAvatarAI(room) {
   if (!room || room.battleMode !== 'avatar') return;
   if (room.players.length < 2) return;
@@ -302,7 +271,10 @@ function clearAvatarAI(room) {
 }
 
 // ─── Match result recording ───
-function recordMatchResult(room) {
+// Async now — writes to Supabase, then emits fresh stats to both sockets.
+// Errors are caught and logged; they never crash the process or block the
+// roundResult emit (which is emitted by the caller separately).
+async function recordMatchResult(room) {
   if (!room || !room.winner) return;
 
   const [p1, p2] = room.players;
@@ -319,37 +291,29 @@ function recordMatchResult(room) {
   const p2Won = room.winner === p2;
 
   const mode = room.battleMode || 'human';
-  // Ties are individual rounds; matches always end with a winner (WIN_TARGET),
-  // so at match level a player either won or lost. humanTies/avatarTies/
-  // dojoTies stay at 0 for now (matches never end in a tie).
   const isHuman = mode === 'human';
   const isAvatar = mode === 'avatar';
   const isDojo = mode === 'dojo';
 
-  const baseMatch = {
-    mode: room.battleMode,
-    p1Score: room.scores[p1] || 0,
-    p2Score: room.scores[p2] || 0,
-    p1Ties: room.ties[p1] || 0,
-    p2Ties: room.ties[p2] || 0,
-    rounds: room.round,
-    timestamp: Date.now(),
-  };
+  const p1Score = room.scores[p1] || 0;
+  const p2Score = room.scores[p2] || 0;
+  const rounds = room.round;
+  const timestamp = Date.now();
 
-  // ── P1 history ──
-  const p1History = matchHistory.get(p1UserId) || [];
-  p1History.unshift({
-    ...baseMatch,
+  // ── P1: history ──
+  await db.appendMatch(p1UserId, {
+    mode: room.battleMode,
     opponent: p2Name,
     opponentId: p2UserId,
     result: p1Won ? 'win' : 'loss',
-    myScore: baseMatch.p1Score,
-    theirScore: baseMatch.p2Score,
+    myScore: p1Score,
+    theirScore: p2Score,
+    rounds,
+    timestamp,
   });
-  matchHistory.set(p1UserId, p1History.slice(0, MAX_HISTORY));
 
-  // ── P1 stats ──
-  const p1Stats = getOrCreateStats(p1UserId);
+  // ── P1: stats ──
+  const p1Stats = await db.getOrCreateStats(p1UserId);
   if (p1Won) {
     p1Stats.wins++;
     p1Stats.currentStreak = (p1Stats.currentStreak || 0) + 1;
@@ -372,22 +336,22 @@ function recordMatchResult(room) {
     if (p1Won) p1Stats.dojoWins++;
     else p1Stats.dojoLosses++;
   }
-  playerStats.set(p1UserId, p1Stats);
+  await db.saveStats(p1UserId, p1Stats);
 
-  // ── P2 history ──
-  const p2History = matchHistory.get(p2UserId) || [];
-  p2History.unshift({
-    ...baseMatch,
+  // ── P2: history ──
+  await db.appendMatch(p2UserId, {
+    mode: room.battleMode,
     opponent: p1Name,
     opponentId: p1UserId,
     result: p2Won ? 'win' : 'loss',
-    myScore: baseMatch.p2Score,
-    theirScore: baseMatch.p1Score,
+    myScore: p2Score,
+    theirScore: p1Score,
+    rounds,
+    timestamp,
   });
-  matchHistory.set(p2UserId, p2History.slice(0, MAX_HISTORY));
 
-  // ── P2 stats ──
-  const p2Stats = getOrCreateStats(p2UserId);
+  // ── P2: stats ──
+  const p2Stats = await db.getOrCreateStats(p2UserId);
   if (p2Won) {
     p2Stats.wins++;
     p2Stats.currentStreak = (p2Stats.currentStreak || 0) + 1;
@@ -410,51 +374,34 @@ function recordMatchResult(room) {
     if (p2Won) p2Stats.dojoWins++;
     else p2Stats.dojoLosses++;
   }
-  playerStats.set(p2UserId, p2Stats);
+  await db.saveStats(p2UserId, p2Stats);
 
-  io.to(p1).emit('playerStats', { stats: playerStats.get(p1UserId) });
-  io.to(p2).emit('playerStats', { stats: playerStats.get(p2UserId) });
+  io.to(p1).emit('playerStats', { stats: p1Stats });
+  io.to(p2).emit('playerStats', { stats: p2Stats });
 
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name, `(${mode})`);
 }
 
 // ─── Leaderboard ───
-function resolveUserMeta(userId) {
-  const acc = accountsByUserId.get(userId);
-  if (acc) {
-    return { username: acc.username, avatar: acc.avatar };
-  }
-  // Fallback: check onlinePlayers for this userId
-  for (const [, p] of onlinePlayers) {
-    if (p.userId === userId) {
-      return { username: p.username, avatar: p.avatar };
-    }
-  }
-  return { username: 'Unknown', avatar: '🤖' };
-}
-
-function buildLeaderboardEntry(userId, stats) {
-  const meta = resolveUserMeta(userId);
-  const total = stats.total || 0;
-  const winRate = total > 0 ? stats.wins / total : 0;
+function buildLeaderboardEntry(row) {
+  const total = row.total || 0;
+  const winRate = total > 0 ? row.wins / total : 0;
   return {
-    userId,
-    username: meta.username,
-    avatar: meta.avatar,
-    wins: stats.wins || 0,
-    losses: stats.losses || 0,
-    ties: stats.ties || 0,
+    userId: row.userId,
+    username: row.username,
+    avatar: row.avatar,
+    wins: row.wins || 0,
+    losses: row.losses || 0,
+    ties: row.ties || 0,
     winRate,
-    bestStreak: stats.bestStreak || 0,
+    bestStreak: row.bestStreak || 0,
     total,
   };
 }
 
-function buildLeaderboard() {
-  const entries = [];
-  for (const [userId, stats] of playerStats) {
-    entries.push(buildLeaderboardEntry(userId, stats));
-  }
+async function buildLeaderboard() {
+  const rows = await db.listStatsWithUsers();
+  const entries = rows.map(buildLeaderboardEntry);
 
   const topByWins = [...entries]
     .sort((a, b) => b.wins - a.wins || b.winRate - a.winRate)
@@ -484,7 +431,6 @@ function startAvatarAutoPlay(roomCode) {
     return;
   }
 
-  // Safety net: if AI wasn't created yet, create it now.
   if (!room.aiState) {
     ensureAvatarAI(room);
   }
@@ -511,7 +457,6 @@ function startAvatarAutoPlay(roomCode) {
     const move1 = ai1.makeMove();
     const move2 = ai2.makeMove();
 
-    // Each AI learns from the opponent's move this round.
     ai1.recordOpponentMove(move2);
     ai2.recordOpponentMove(move1);
 
@@ -546,9 +491,10 @@ function startAvatarAutoPlay(roomCode) {
     if (matchWinner) {
       r.matchOver = true;
       r.winner = matchWinner;
-      recordMatchResult(r);
-      // NOTE: no resetPlayersToOnline here —
-      // status flips to online when client emits leaveMatchScreen
+      // Fire and forget — recordMatchResult emits playerStats itself.
+      recordMatchResult(r).catch((e) =>
+        console.error('[MATCH RECORD ERROR]', e?.message)
+      );
     }
 
     io.to(roomCode).emit('roundResult', {
@@ -593,7 +539,7 @@ io.on('connection', (socket) => {
   //   Restore: { token: <hex>,       username?, avatar? }
   // Responds: identityRegistered { userId, token, username, avatar }
   // ────────────────────────────────────────────────────────────
-  socket.on('registerIdentity', (data) => {
+  socket.on('registerIdentity', async (data) => {
     const incomingToken = (typeof data?.token === 'string' && data.token.trim()) || null;
     const rawUsername = (data?.username || '').trim().slice(0, 15);
     const incomingAvatar = data?.avatar || null;
@@ -602,27 +548,29 @@ io.on('connection', (socket) => {
 
     // Path A: restore existing account via token
     if (incomingToken) {
-      const found = userAccounts.get(incomingToken);
+      const found = await db.getUserByToken(incomingToken);
       if (found) {
         account = { ...found };
-        // Optional updates
+
+        // Optional username update (same rules as before)
         if (rawUsername && rawUsername.length >= 3) {
           const normalized = normalizeUsername(rawUsername);
-          if (normalized && normalized !== account.username && isUsernameAvailable(normalized, account.userId)) {
+          if (
+            normalized &&
+            normalized !== account.username &&
+            (await isUsernameAvailable(normalized, account.userId))
+          ) {
+            await db.updateUsername(account.userId, normalized, account.avatar);
             account.username = normalized;
           }
         }
-        if (incomingAvatar) account.avatar = incomingAvatar;
 
-        // Persist updates
-        const stored = userAccounts.get(incomingToken);
-        stored.username = account.username;
-        stored.avatar = account.avatar;
-        const byId = accountsByUserId.get(account.userId);
-        if (byId) {
-          byId.username = account.username;
-          byId.avatar = account.avatar;
+        // Optional avatar update
+        if (incomingAvatar && incomingAvatar !== account.avatar) {
+          await db.updateAvatar(account.userId, incomingAvatar);
+          account.avatar = incomingAvatar;
         }
+
         console.log('[IDENTITY] Restored', socket.id, '→', account.username, `(${account.userId})`);
       } else {
         console.log('[IDENTITY] Token invalid/unknown — treating as fresh registration');
@@ -643,29 +591,22 @@ io.on('connection', (socket) => {
         socket.emit('identityError', { message: 'Invalid username' });
         return;
       }
-      const finalUsername = generateUniqueUsername(normalized, userId);
+      const finalUsername = await generateUniqueUsername(normalized, userId);
       const avatar = incomingAvatar || '🤖';
 
-      account = {
-        userId,
-        token,
-        username: finalUsername,
-        avatar,
-        createdAt: Date.now(),
-      };
-
-      userAccounts.set(token, {
-        userId,
-        username: finalUsername,
-        avatar,
-        createdAt: account.createdAt,
-      });
-      accountsByUserId.set(userId, {
-        token,
-        username: finalUsername,
-        avatar,
-        createdAt: account.createdAt,
-      });
+      try {
+        account = await db.createUser({
+          userId,
+          token,
+          username: finalUsername,
+          avatar,
+          createdAt: Date.now(),
+        });
+      } catch (err) {
+        console.error('[IDENTITY] createUser failed:', err?.message);
+        socket.emit('identityError', { message: 'Registration failed, try again' });
+        return;
+      }
 
       console.log('[IDENTITY] Fresh', socket.id, '→', finalUsername, `(${userId})`);
     }
@@ -679,7 +620,6 @@ io.on('connection', (socket) => {
         });
         const oldSocket = io.sockets.sockets.get(existingSocketId);
         if (oldSocket) {
-          // Give the emit a tick to flush, then kill the ghost socket
           setTimeout(() => {
             try { oldSocket.disconnect(true); } catch {}
           }, 50);
@@ -711,7 +651,7 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    const existingStats = getOrCreateStats(account.userId);
+    const existingStats = await db.getOrCreateStats(account.userId);
     socket.emit('playerStats', { stats: existingStats });
 
     socket.emit('identityRegistered', {
@@ -726,13 +666,19 @@ io.on('connection', (socket) => {
   // changeUsername — token identifies the caller.
   // Payload: { newUsername }
   // ────────────────────────────────────────────────────────────
-  socket.on('changeUsername', (data) => {
+  socket.on('changeUsername', async (data) => {
     const newUsername = (data?.newUsername || '').trim().slice(0, 15);
 
     const player = players.get(socket.id);
     const token = player?.token;
-    const account = token ? userAccounts.get(token) : null;
-
+    if (!token) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'Not authenticated',
+      });
+      return;
+    }
+    const account = await db.getUserByToken(token);
     if (!account) {
       socket.emit('changeUsernameResult', {
         success: false,
@@ -758,7 +704,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (normalized !== account.username && !isUsernameAvailable(normalized, account.userId)) {
+    if (
+      normalized !== account.username &&
+      !(await isUsernameAvailable(normalized, account.userId))
+    ) {
       socket.emit('changeUsernameResult', {
         success: false,
         message: 'That username is already taken',
@@ -766,12 +715,18 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Update account
-    account.username = normalized;
-    const byId = accountsByUserId.get(account.userId);
-    if (byId) byId.username = normalized;
+    // Persist — db layer enforces uniqueness via the unique index, so a
+    // race that slipped past the pre-check will surface here as false.
+    const ok = await db.updateUsername(account.userId, normalized);
+    if (!ok) {
+      socket.emit('changeUsernameResult', {
+        success: false,
+        message: 'That username is already taken',
+      });
+      return;
+    }
 
-    // Update live player entries
+    // Update live player entries (display keeps raw form, key stays normalized)
     if (player) {
       player.name = newUsername;
       player.username = normalized;
@@ -796,7 +751,7 @@ io.on('connection', (socket) => {
   // ────────────────────────────────────────────────────────────
   // deleteAccount — token identifies the caller.
   // ────────────────────────────────────────────────────────────
-  socket.on('deleteAccount', () => {
+  socket.on('deleteAccount', async () => {
     console.log('[DELETE ACCOUNT]', socket.id);
 
     const player = players.get(socket.id);
@@ -813,11 +768,8 @@ io.on('connection', (socket) => {
 
     players.delete(socket.id);
 
-    if (token) userAccounts.delete(token);
     if (userId) {
-      accountsByUserId.delete(userId);
-      matchHistory.delete(userId);
-      playerStats.delete(userId);
+      await db.deleteUser(userId);
     }
 
     socket.emit('deleteAccountResult', {
@@ -830,31 +782,31 @@ io.on('connection', (socket) => {
     }, 300);
   });
 
-  socket.on('getMatchHistory', () => {
+  socket.on('getMatchHistory', async () => {
     const player = players.get(socket.id);
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
     if (!userId) {
       socket.emit('matchHistory', { matches: [] });
       return;
     }
-    const matches = matchHistory.get(userId) || [];
+    const matches = await db.getMatchHistory(userId);
     socket.emit('matchHistory', { matches });
   });
 
-  socket.on('getPlayerStats', () => {
+  socket.on('getPlayerStats', async () => {
     const player = players.get(socket.id);
     const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
     if (!userId) {
-      socket.emit('playerStats', { stats: createEmptyStats() });
+      socket.emit('playerStats', { stats: db.createEmptyStats() });
       return;
     }
-    const stats = getOrCreateStats(userId);
+    const stats = await db.getOrCreateStats(userId);
     socket.emit('playerStats', { stats });
   });
 
   // ─── Pull-based leaderboard ───
-  socket.on('getLeaderboard', () => {
-    const leaderboard = buildLeaderboard();
+  socket.on('getLeaderboard', async () => {
+    const leaderboard = await buildLeaderboard();
     socket.emit('leaderboard', leaderboard);
   });
 
@@ -877,7 +829,7 @@ io.on('connection', (socket) => {
     socket.emit('onlineCount', { count: onlinePlayers.size });
   });
 
-  // ─── Match screen presence (client tells us when on/off the match screen) ───
+  // ─── Match screen presence ───
   socket.on('enterMatchScreen', () => {
     setPlayerStatus(socket.id, 'in-match');
   });
@@ -940,7 +892,6 @@ io.on('connection', (socket) => {
       status: 'pending',
       createdAt: Date.now(),
       battleMode: data.battleMode || 'human',
-      // Personality of the inviter's chosen avatar (object | string | undefined)
       fromAvatarPersonality: data.avatarPersonality ?? null,
     };
 
@@ -1010,7 +961,6 @@ io.on('connection', (socket) => {
           [invite.fromId]: [],
           [invite.toId]: [],
         },
-        // Per-player avatar personality (object | string | undefined)
         avatarPersonalities: {
           [invite.fromId]: invite.fromAvatarPersonality ?? null,
           [invite.toId]: data.avatarPersonality ?? null,
@@ -1031,7 +981,6 @@ io.on('connection', (socket) => {
 
       const playerList = getRoomPlayers(room);
 
-      // If avatar mode, build AI instances now (both players are known).
       if (room.battleMode === 'avatar') {
         ensureAvatarAI(room);
       }
@@ -1240,7 +1189,6 @@ io.on('connection', (socket) => {
     });
 
     console.log('[JOIN ROOM]', socket.id, '→', code, `(${room.battleMode})`);
-    console.log('[JOIN ROOM] battleMode:', room.battleMode, '| players:', room.players.length);
 
     if (room.battleMode === 'avatar' && room.players.length === 2) {
       ensureAvatarAI(room);
@@ -1290,8 +1238,9 @@ io.on('connection', (socket) => {
       if (matchWinner) {
         room.matchOver = true;
         room.winner = matchWinner;
-        recordMatchResult(room);
-        // NOTE: no resetPlayersToOnline — status is client-driven
+        recordMatchResult(room).catch((e) =>
+          console.error('[MATCH RECORD ERROR]', e?.message)
+        );
       }
 
       io.to(player.room).emit('roundResult', {
@@ -1339,7 +1288,6 @@ io.on('connection', (socket) => {
       room.avatarAutoTimer = null;
     }
 
-    // Fresh AI for the rematch — the previous match's learning is discarded.
     clearAvatarAI(room);
 
     resetRoomScores(room);
@@ -1422,7 +1370,9 @@ function handleDisconnect(socketId) {
     if (winnerId) {
       room.matchOver = true;
       room.winner = winnerId;
-      recordMatchResult(room);
+      recordMatchResult(room).catch((e) =>
+        console.error('[MATCH RECORD ERROR]', e?.message)
+      );
       io.to(winnerId).emit('opponentTimedOut', {
         winnerId,
         loserId: disconnectedId,
@@ -1464,7 +1414,6 @@ function handleLeave(socketId, notify = false) {
       if (room.players.length === 0) {
         rooms.delete(player.room);
       } else {
-        // Remaining players → online (they're no longer in a match)
         resetPlayersToOnline(room);
       }
     }
