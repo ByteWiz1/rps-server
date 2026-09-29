@@ -7,24 +7,26 @@
 // Chat 2: adaptive AI engine wired into Avatar Arena, per-mode stats,
 //         overall streaks, pull-based leaderboard.
 // Chat 4: persistent state migrated from in-memory Maps to Supabase.
-//         Auth flow, event names, and payload shapes UNCHANGED.
-// Chat 5: Dojo stats sync (roadmap item #2). New socket event
-//         `recordDojoMatch` writes dojo W/L/T + overall W/L/T + streaks
-//         to Supabase and inserts a match_history row with mode 'dojo'.
-//         Does NOT touch human/avatar per-mode stats.
-// Chat 7: Achievements (roadmap item #4). After every recorded match
-//         (human / avatar / dojo), db.checkAchievements() runs and any
-//         newly-unlocked achievements are pushed to the player's socket
-//         as 'achievementUnlocked'. Two new pull events added:
-//         getAchievements, getAchievementCatalog.
-//         Match recording now also updates the Chat 7 tracking fields
-//         (opponentsPlayed, dailyWinDates, masterWins).
-//
-// Persistent (Supabase via db.js):
-//   users, auth_tokens, player_stats, match_history, achievements
-//
-// Ephemeral (still in-memory, intentionally):
-//   rooms, players, onlinePlayers, activeInvites, recentOpponents
+// Chat 5: Dojo stats sync (roadmap item #2).
+// Chat 7: Achievements (roadmap item #4).
+// Chat 9: Supabase Auth migration (Option A-lite).
+//   - Removed: server-issued tokens, generateToken / generateUserId,
+//     registerIdentity handler's legacy registration path.
+//   - Added: JWT middleware. Verifies Supabase JWT from the socket
+//     handshake (auth.token) with SUPABASE_JWT_SECRET, extracts `sub`
+//     (the Supabase UID) and attaches to socket.data.userId.
+//   - Added: 'identify' handler. Runs after JWT auth, ensures a
+//     public.users row exists (via db.ensureUserRow), registers
+//     presence in onlinePlayers, emits 'selfRegistered'.
+//   - Added: 'migrateLegacyToken' handler. Accepts an old custom
+//     token, migrates the user to a Supabase UID server-side, and
+//     returns the new session tokens to the client.
+//   - changeUsername now uses socket.data.userId and syncs
+//     public.users + public.profiles + auth.users.user_metadata.
+//   - deleteAccount now uses socket.data.userId and calls
+//     db.deleteUserEverywhere (also removes the auth.users row).
+//   - Session replacement kept. Emits 'sessionReplaced' to the older
+//     socket for the same userId, then disconnects it.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -34,6 +36,7 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 const { createAdaptiveAI } = require('./aiEngine');
 const db = require('./db');
@@ -46,10 +49,19 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
+// ─── Env ───
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+if (!SUPABASE_JWT_SECRET) {
+  console.error(
+    '[SERVER] Missing SUPABASE_JWT_SECRET. Set it on Render ' +
+    '(Supabase dashboard → Settings → API → JWT Secret).'
+  );
+}
+
 // ─── In-memory state (ephemeral — survives only while the process is up) ───
 const rooms = new Map();
-const players = new Map();          // socketId → { room, name, username, userId, token, avatar }
-const onlinePlayers = new Map();    // socketId → { userId, name, username, avatar, status, socketId, token, connectedAt }
+const players = new Map();          // socketId → { room, name, username, userId, avatar }
+const onlinePlayers = new Map();    // socketId → { userId, name, username, avatar, status, socketId, connectedAt }
 const activeInvites = new Map();
 const recentOpponents = new Map();
 
@@ -69,14 +81,6 @@ function generateRoomCode() {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
-}
-
-function generateUserId() {
-  return 'user_' + crypto.randomBytes(12).toString('hex');
-}
-
-function generateToken() {
-  return crypto.randomBytes(32).toString('hex');
 }
 
 function normalizeUsername(name) {
@@ -273,9 +277,6 @@ function clearAvatarAI(room) {
 }
 
 // ─── Achievement emission helper (Chat 7) ───
-// Given a socketId and the array of catalog entries returned by
-// db.checkAchievements, emit one 'achievementUnlocked' event per entry.
-// Client payload: { id, name, description, icon, category }.
 function emitAchievementsToSocket(socketId, unlocked) {
   if (!socketId || !Array.isArray(unlocked) || unlocked.length === 0) return;
   for (const a of unlocked) {
@@ -290,10 +291,6 @@ function emitAchievementsToSocket(socketId, unlocked) {
 }
 
 // ─── Chat 7 tracking helpers ───
-// Mutate a stats object in place to reflect the tracking fields the
-// achievement rules depend on.
-
-// Add opponentId to opponentsPlayed if not already present.
 function trackOpponent(stats, opponentId) {
   if (!stats || !opponentId) return;
   if (!Array.isArray(stats.opponentsPlayed)) stats.opponentsPlayed = [];
@@ -302,8 +299,6 @@ function trackOpponent(stats, opponentId) {
   }
 }
 
-// Append today's 'YYYY-MM-DD' to dailyWinDates if not already present.
-// Only called when the player won.
 function trackDailyWin(stats) {
   if (!stats) return;
   if (!Array.isArray(stats.dailyWinDates)) stats.dailyWinDates = [];
@@ -313,7 +308,6 @@ function trackDailyWin(stats) {
   }
 }
 
-// Ensure masterWins exists with all four keys.
 function ensureMasterWins(stats) {
   if (!stats) return;
   if (!stats.masterWins || typeof stats.masterWins !== 'object') {
@@ -325,7 +319,6 @@ function ensureMasterWins(stats) {
   }
 }
 
-// Increment masterWins[masterId] by 1.
 function trackMasterWin(stats, masterId) {
   if (!stats || !masterId) return;
   ensureMasterWins(stats);
@@ -333,13 +326,6 @@ function trackMasterWin(stats, masterId) {
 }
 
 // ─── Match result recording (human / avatar rooms) ───
-// Async — writes to Supabase, then emits fresh stats to both sockets.
-// Errors are caught and logged; they never crash the process or block the
-// roundResult emit (which is emitted by the caller separately).
-//
-// Chat 7: also updates opponentsPlayed (both players, mutual) and
-// dailyWinDates (winner only), then runs checkAchievements for both
-// users and emits 'achievementUnlocked' for any fresh unlocks.
 async function recordMatchResult(room) {
   if (!room || !room.winner) return;
 
@@ -403,7 +389,6 @@ async function recordMatchResult(room) {
     else p1Stats.dojoLosses++;
   }
 
-  // Chat 7 tracking
   trackOpponent(p1Stats, p2UserId);
   if (p1Won) trackDailyWin(p1Stats);
 
@@ -446,7 +431,6 @@ async function recordMatchResult(room) {
     else p2Stats.dojoLosses++;
   }
 
-  // Chat 7 tracking
   trackOpponent(p2Stats, p1UserId);
   if (p2Won) trackDailyWin(p2Stats);
 
@@ -457,9 +441,6 @@ async function recordMatchResult(room) {
 
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:', room.winner === p1 ? p1Name : p2Name, `(${mode})`);
 
-  // ── Chat 7: achievements for both players ──
-  // Non-blocking — any failure is logged and swallowed so a broken
-  // achievement rule never affects match recording.
   try {
     const p1Unlocked = await db.checkAchievements(p1UserId);
     emitAchievementsToSocket(p1, p1Unlocked);
@@ -475,35 +456,7 @@ async function recordMatchResult(room) {
   }
 }
 
-// ─── Dojo match recording (Chat 5 — roadmap item #2) ───
-// Called directly from the `recordDojoMatch` socket event. Dojo matches
-// are single-player vs. an AI master, so there is no room and no opponent
-// socket — we only mutate the caller's stats and history.
-//
-// Payload:
-//   {
-//     result: 'win' | 'loss' | 'tie',
-//     opponentName: string,
-//     myScore: number, opponentScore: number,
-//     myTies: number, opponentTies: number,
-//     rounds: number
-//   }
-//
-// Rules:
-//   - Only dojoWins/Losses/Ties + overall wins/losses/ties/total + streaks
-//     are mutated. human*/avatar* per-mode stats are untouched.
-//   - `total` matches recordMatchResult: wins + losses (ties excluded).
-//   - currentStreak: win → +1, loss → 0, tie → unchanged.
-//   - bestStreak = max(bestStreak, currentStreak).
-//   - Ties per side are NOT persisted (match_history has no columns for
-//     them).
-//
-// Chat 7 additions:
-//   - On a win, append today's date to dailyWinDates.
-//   - On a win, if the opponentName maps to one of the four master ids,
-//     increment masterWins[masterId].
-//   - After saving stats, run checkAchievements and return the fresh
-//     unlocks alongside the stats so the caller can emit them.
+// ─── Dojo match recording ───
 async function recordDojoMatchResult(userId, payload) {
   if (!userId) return null;
 
@@ -518,7 +471,6 @@ async function recordDojoMatchResult(userId, payload) {
   const rounds = Math.max(0, Math.min(9999, Math.floor(Number(payload?.rounds) || 0)));
   const timestamp = Date.now();
 
-  // ── History ──
   await db.appendMatch(userId, {
     mode: 'dojo',
     opponent: opponentName,
@@ -530,7 +482,6 @@ async function recordDojoMatchResult(userId, payload) {
     timestamp,
   });
 
-  // ── Stats ──
   const stats = await db.getOrCreateStats(userId);
 
   if (result === 'win') {
@@ -545,16 +496,12 @@ async function recordDojoMatchResult(userId, payload) {
     stats.dojoLosses++;
     stats.currentStreak = 0;
   } else {
-    // tie
     stats.ties++;
     stats.dojoTies++;
-    // currentStreak unchanged on tie (mirrors recordMatchResult, which
-    // has no tie branch at all).
   }
 
   stats.total = stats.wins + stats.losses;
 
-  // Chat 7 tracking
   if (result === 'win') {
     trackDailyWin(stats);
     const masterId = db.resolveMasterId(opponentName);
@@ -568,7 +515,6 @@ async function recordDojoMatchResult(userId, payload) {
     '→', result, `(${myScore}-${opponentScore}, ${rounds} rounds)`,
   );
 
-  // Chat 7: run achievement check for this user.
   let unlocked = [];
   try {
     unlocked = await db.checkAchievements(userId);
@@ -716,99 +662,119 @@ function startAvatarAutoPlay(roomCode) {
   console.log('[AVATAR AUTO] Started for room', roomCode);
 }
 
+// ════════════════════════════════════════════════════════════
+// Socket.IO JWT middleware — Chat 9
+// ════════════════════════════════════════════════════════════
+// Reads socket.handshake.auth.token, verifies it with
+// SUPABASE_JWT_SECRET, extracts `sub` (the Supabase UID) and attaches
+// it to socket.data.userId.
+//
+// Migration path: if the client sends an old custom token via
+// auth.legacyToken instead of a JWT, we DON'T reject — we leave
+// socket.data.userId null and let the 'migrateLegacyToken' handler
+// run. This is the only socket that can be un-authenticated.
+//
+// All OTHER sockets must present a valid JWT or they're rejected
+// at handshake time.
+io.use((socket, next) => {
+  const auth = socket.handshake.auth || {};
+  const token = typeof auth.token === 'string' ? auth.token : null;
+  const legacyToken =
+    typeof auth.legacyToken === 'string' ? auth.legacyToken : null;
+
+  // Legacy-only socket: allow connect, but socket.data.userId stays null.
+  if (!token && legacyToken) {
+    socket.data.userId = null;
+    socket.data.legacyOnly = true;
+    return next();
+  }
+
+  if (!token) {
+    // No auth at all. Allow the connect but mark as anonymous-unauthed.
+    // Server handlers guard on socket.data.userId so this is safe.
+    socket.data.userId = null;
+    return next();
+  }
+
+  try {
+    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET, {
+      algorithms: ['HS256'],
+    });
+    if (!decoded?.sub) {
+      return next(new Error('invalid-jwt-no-sub'));
+    }
+    socket.data.userId = String(decoded.sub);
+    socket.data.jwtPayload = decoded;
+    return next();
+  } catch (e) {
+    // Invalid / expired token → reject handshake. Client must refresh.
+    console.error('[JWT] verify failed:', e?.message);
+    return next(new Error('invalid-jwt'));
+  }
+});
+
 io.on('connection', (socket) => {
-  console.log('[CONNECT]', socket.id);
+  console.log('[CONNECT]', socket.id, '| userId:', socket.data.userId || '(none)');
   players.set(socket.id, {
     room: null,
     name: 'Player',
     username: null,
-    userId: null,
-    token: null,
+    userId: socket.data.userId || null,
     avatar: '🤖',
   });
 
   socket.emit('connected', { playerId: socket.id });
 
   // ────────────────────────────────────────────────────────────
-  // registerIdentity
-  //   Fresh:   { token: null,        username, avatar }
-  //   Restore: { token: <hex>,       username?, avatar? }
-  // Responds: identityRegistered { userId, token, username, avatar }
+  // identify  (Chat 9)
+  //   Called by the client immediately after socket connect.
+  //   Ensures a public.users row exists for socket.data.userId,
+  //   registers presence, emits 'selfRegistered'.
+  //
+  //   Payload: { username?, avatar? }
+  //   Emits:   selfRegistered { userId, username, avatar, isPremium, email, isAnonymous }
   // ────────────────────────────────────────────────────────────
-  socket.on('registerIdentity', async (data) => {
-    const incomingToken = (typeof data?.token === 'string' && data.token.trim()) || null;
+  socket.on('identify', async (data) => {
+    const uid = socket.data.userId;
+    if (!uid) {
+      // Legacy-only or unauthenticated socket. Wait for migrateLegacyToken
+      // or the client to sign in. Don't error — migration is a valid flow.
+      if (socket.data.legacyOnly) return;
+      socket.emit('identifyError', { message: 'Not authenticated' });
+      return;
+    }
+
     const rawUsername = (data?.username || '').trim().slice(0, 15);
     const incomingAvatar = data?.avatar || null;
 
-    let account = null;
-
-    // Path A: restore existing account via token
-    if (incomingToken) {
-      const found = await db.getUserByToken(incomingToken);
-      if (found) {
-        account = { ...found };
-
-        if (rawUsername && rawUsername.length >= 3) {
-          const normalized = normalizeUsername(rawUsername);
-          if (
-            normalized &&
-            normalized !== account.username &&
-            (await isUsernameAvailable(normalized, account.userId))
-          ) {
-            await db.updateUsername(account.userId, normalized, account.avatar);
-            account.username = normalized;
-          }
-        }
-
-        if (incomingAvatar && incomingAvatar !== account.avatar) {
-          await db.updateAvatar(account.userId, incomingAvatar);
-          account.avatar = incomingAvatar;
-        }
-
-        console.log('[IDENTITY] Restored', socket.id, '→', account.username, `(${account.userId})`);
-      } else {
-        console.log('[IDENTITY] Token invalid/unknown — treating as fresh registration');
-      }
-    }
-
-    // Path B: fresh registration (no token, or invalid token)
-    if (!account) {
-      if (!rawUsername || rawUsername.length < 3) {
-        socket.emit('identityError', { message: 'Invalid identity data' });
-        return;
-      }
-
-      const userId = generateUserId();
-      const token = generateToken();
+    // Normalize + uniqueness-check only if a username was supplied.
+    let finalUsername = null;
+    if (rawUsername && rawUsername.length >= 3) {
       const normalized = normalizeUsername(rawUsername);
-      if (!normalized || normalized.length < 3) {
-        socket.emit('identityError', { message: 'Invalid username' });
-        return;
+      if (normalized && normalized.length >= 3) {
+        finalUsername = await generateUniqueUsername(normalized, uid);
       }
-      const finalUsername = await generateUniqueUsername(normalized, userId);
-      const avatar = incomingAvatar || '🤖';
-
-      try {
-        account = await db.createUser({
-          userId,
-          token,
-          username: finalUsername,
-          avatar,
-          createdAt: Date.now(),
-        });
-      } catch (err) {
-        console.error('[IDENTITY] createUser failed:', err?.message);
-        socket.emit('identityError', { message: 'Registration failed, try again' });
-        return;
-      }
-
-      console.log('[IDENTITY] Fresh', socket.id, '→', finalUsername, `(${userId})`);
     }
 
-    // ─── Session replacement ───
+    // Ensure the row exists.
+    const user = await db.ensureUserRow(uid, {
+      username: finalUsername,
+      avatar: incomingAvatar,
+    });
+
+    if (!user) {
+      socket.emit('identifyError', { message: 'Registration failed' });
+      return;
+    }
+
+    // Profile (is_premium, email state).
+    const profile = await db.getProfile(uid);
+
+    // Session replacement: if another socket already has this userId,
+    // kick the OLD one. Last connect wins.
     for (const [existingSocketId, existingPlayer] of onlinePlayers) {
-      if (existingPlayer.userId === account.userId && existingSocketId !== socket.id) {
-        console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${account.userId})`);
+      if (existingPlayer.userId === uid && existingSocketId !== socket.id) {
+        console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${uid})`);
         io.to(existingSocketId).emit('sessionReplaced', {
           reason: 'logged-in-elsewhere',
         });
@@ -821,57 +787,129 @@ io.on('connection', (socket) => {
       }
     }
 
-    // ─── Populate players + onlinePlayers for THIS socket ───
+    // Populate players + onlinePlayers.
     const player = players.get(socket.id);
     if (player) {
-      player.name = account.username;
-      player.username = account.username;
-      player.userId = account.userId;
-      player.token = account.token;
-      player.avatar = account.avatar;
+      player.name = user.username;
+      player.username = user.username;
+      player.userId = uid;
+      player.avatar = user.avatar;
     }
 
     onlinePlayers.set(socket.id, {
-      userId: account.userId,
-      name: account.username,
-      username: account.username,
-      avatar: account.avatar,
+      userId: uid,
+      name: user.username,
+      username: user.username,
+      avatar: user.avatar,
       status: 'online',
       socketId: socket.id,
-      token: account.token,
       connectedAt: Date.now(),
     });
 
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    const existingStats = await db.getOrCreateStats(account.userId);
-    socket.emit('playerStats', { stats: existingStats });
+    const stats = await db.getOrCreateStats(uid);
+    socket.emit('playerStats', { stats });
 
-    socket.emit('identityRegistered', {
-      userId: account.userId,
-      token: account.token,
-      username: account.username,
-      avatar: account.avatar,
+    // Decode email/isAnonymous from the JWT payload.
+    // Supabase JWTs carry the auth user's email and role; anonymous
+    // users have no email and is_anonymous=true in user_metadata.
+    const payload = socket.data.jwtPayload || {};
+    const meta = payload.user_metadata || {};
+    const isAnonymous = !payload.email || meta.is_anonymous === true;
+
+    socket.emit('selfRegistered', {
+      userId: uid,
+      username: user.username,
+      avatar: user.avatar,
+      isPremium: !!(profile && profile.is_premium),
+      premiumSince: profile?.premium_since || null,
+      email: payload.email || null,
+      isAnonymous,
     });
+
+    console.log('[IDENTIFY]', socket.id, '→', user.username, `(${uid})`);
   });
 
   // ────────────────────────────────────────────────────────────
-  // changeUsername — token identifies the caller.
+  // migrateLegacyToken  (Chat 9)
+  //   Payload: { token }
+  //   Emits:   legacyMigrationResult {
+  //              success, userId?, access_token?, refresh_token?, message?
+  //            }
+  //
+  //   Old clients that still have a custom token use this to migrate
+  //   in-place. Server creates a Supabase user, rewrites all rows,
+  //   returns fresh session tokens. Client calls
+  //   supabase.auth.setSession({ access_token, refresh_token }).
+  // ────────────────────────────────────────────────────────────
+  socket.on('migrateLegacyToken', async (data) => {
+    const legacyToken = typeof data?.token === 'string' ? data.token : null;
+    if (!legacyToken) {
+      socket.emit('legacyMigrationResult', {
+        success: false,
+        message: 'No token provided',
+      });
+      return;
+    }
+
+    try {
+      const oldUserId = await db.findLegacyUserIdByToken(legacyToken);
+      if (!oldUserId) {
+        socket.emit('legacyMigrationResult', {
+          success: false,
+          message: 'Token not found',
+        });
+        return;
+      }
+
+      const result = await db.migrateLegacyUser(oldUserId, legacyToken);
+      if (!result || !result.newUid) {
+        socket.emit('legacyMigrationResult', {
+          success: false,
+          message: 'Migration failed',
+        });
+        return;
+      }
+
+      // Delete the legacy token row — this client is now on Supabase Auth.
+      await db.deleteLegacyToken(legacyToken);
+
+      socket.emit('legacyMigrationResult', {
+        success: true,
+        userId: result.newUid,
+        access_token: result.access_token,
+        refresh_token: result.refresh_token,
+      });
+
+      console.log('[MIGRATION]', socket.id, oldUserId, '→', result.newUid);
+    } catch (e) {
+      console.error('[MIGRATION ERROR]', e?.message || e);
+      socket.emit('legacyMigrationResult', {
+        success: false,
+        message: 'Migration failed',
+      });
+    }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // changeUsername — authenticated via socket.data.userId.
+  // Syncs public.users, public.profiles, and auth.users.user_metadata.
   // ────────────────────────────────────────────────────────────
   socket.on('changeUsername', async (data) => {
+    const uid = socket.data.userId;
     const newUsername = (data?.newUsername || '').trim().slice(0, 15);
 
-    const player = players.get(socket.id);
-    const token = player?.token;
-    if (!token) {
+    if (!uid) {
       socket.emit('changeUsernameResult', {
         success: false,
         message: 'Not authenticated',
       });
       return;
     }
-    const account = await db.getUserByToken(token);
+
+    const account = await db.getUserById(uid);
     if (!account) {
       socket.emit('changeUsernameResult', {
         success: false,
@@ -899,7 +937,7 @@ io.on('connection', (socket) => {
 
     if (
       normalized !== account.username &&
-      !(await isUsernameAvailable(normalized, account.userId))
+      !(await isUsernameAvailable(normalized, uid))
     ) {
       socket.emit('changeUsernameResult', {
         success: false,
@@ -908,7 +946,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const ok = await db.updateUsername(account.userId, normalized);
+    const ok = await db.updateUsername(uid, normalized);
     if (!ok) {
       socket.emit('changeUsernameResult', {
         success: false,
@@ -917,6 +955,14 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Sync profile + auth metadata (best-effort — public.users is
+    // the canonical game-data store; drift is a known risk).
+    db.updateProfileUsername(uid, normalized).catch(() => {});
+    db.supabase.auth.admin
+      .updateUserById(uid, { user_metadata: { username: normalized } })
+      .catch(() => {});
+
+    const player = players.get(socket.id);
     if (player) {
       player.name = newUsername;
       player.username = normalized;
@@ -939,15 +985,16 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // deleteAccount — token identifies the caller.
+  // deleteAccount — authenticated via socket.data.userId.
+  // Deletes public.users (cascades game data) AND auth.users
+  // (cascades profiles).
   // ────────────────────────────────────────────────────────────
   socket.on('deleteAccount', async () => {
     console.log('[DELETE ACCOUNT]', socket.id);
 
-    const player = players.get(socket.id);
-    const token = player?.token || onlinePlayers.get(socket.id)?.token;
-    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
+    const uid = socket.data.userId;
 
+    const player = players.get(socket.id);
     if (player && player.room) {
       handleLeave(socket.id, true);
     }
@@ -958,8 +1005,8 @@ io.on('connection', (socket) => {
 
     players.delete(socket.id);
 
-    if (userId) {
-      await db.deleteUser(userId);
+    if (uid) {
+      await db.deleteUserEverywhere(uid);
     }
 
     socket.emit('deleteAccountResult', {
@@ -973,52 +1020,37 @@ io.on('connection', (socket) => {
   });
 
   socket.on('getMatchHistory', async () => {
-    const player = players.get(socket.id);
-    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
-    if (!userId) {
+    const uid = socket.data.userId;
+    if (!uid) {
       socket.emit('matchHistory', { matches: [] });
       return;
     }
-    const matches = await db.getMatchHistory(userId);
+    const matches = await db.getMatchHistory(uid);
     socket.emit('matchHistory', { matches });
   });
 
   socket.on('getPlayerStats', async () => {
-    const player = players.get(socket.id);
-    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
-    if (!userId) {
+    const uid = socket.data.userId;
+    if (!uid) {
       socket.emit('playerStats', { stats: db.createEmptyStats() });
       return;
     }
-    const stats = await db.getOrCreateStats(userId);
+    const stats = await db.getOrCreateStats(uid);
     socket.emit('playerStats', { stats });
   });
 
   // ────────────────────────────────────────────────────────────
-  // recordDojoMatch  (Chat 5 — roadmap item #2)
-  // Payload: {
-  //   result: 'win' | 'loss' | 'tie',
-  //   opponentName, myScore, opponentScore,
-  //   myTies, opponentTies, rounds
-  // }
-  // Caller is authenticated via the socket's registered userId.
-  // Emits updated playerStats back to this socket on success.
-  //
-  // Chat 7: also emits 'achievementUnlocked' for any fresh unlocks
-  // returned by recordDojoMatchResult.
+  // recordDojoMatch
   // ────────────────────────────────────────────────────────────
   socket.on('recordDojoMatch', async (data) => {
-    const player = players.get(socket.id);
-    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
-
-    if (!userId) {
-      // Not registered — silently ignore (matches other auth guards).
+    const uid = socket.data.userId;
+    if (!uid) {
       console.log('[DOJO RECORD] Unauthenticated socket, ignored:', socket.id);
       return;
     }
 
     try {
-      const result = await recordDojoMatchResult(userId, data);
+      const result = await recordDojoMatchResult(uid, data);
       if (result) {
         socket.emit('playerStats', { stats: result.stats });
         emitAchievementsToSocket(socket.id, result.unlocked);
@@ -1029,21 +1061,17 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // getAchievements  (Chat 7 — roadmap item #4)
-  // Returns { unlocked: { [achievementId]: unlockedAt } } for the
-  // caller. Unauthenticated sockets get an empty map.
+  // getAchievements / getAchievementCatalog
   // ────────────────────────────────────────────────────────────
   socket.on('getAchievements', async () => {
-    const player = players.get(socket.id);
-    const userId = player?.userId || onlinePlayers.get(socket.id)?.userId;
-
-    if (!userId) {
+    const uid = socket.data.userId;
+    if (!uid) {
       socket.emit('achievements', { unlocked: {} });
       return;
     }
 
     try {
-      const unlocked = await db.getUnlockedMap(userId);
+      const unlocked = await db.getUnlockedMap(uid);
       socket.emit('achievements', { unlocked });
     } catch (e) {
       console.error('[ACHIEVEMENTS] getAchievements failed:', e?.message);
@@ -1051,11 +1079,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ────────────────────────────────────────────────────────────
-  // getAchievementCatalog  (Chat 7 — roadmap item #4)
-  // Returns { catalog: ACHIEVEMENT_CATALOG }. No auth required —
-  // the catalog is public static data.
-  // ────────────────────────────────────────────────────────────
   socket.on('getAchievementCatalog', () => {
     socket.emit('achievementCatalog', { catalog: db.ACHIEVEMENT_CATALOG });
   });

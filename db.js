@@ -12,20 +12,30 @@
 //   - New table `achievements` (userId, achievementId, unlockedAt).
 //   - New player_stats columns: opponentsPlayed text[], dailyWinDates
 //     text[], masterWins jsonb.
-//   - ACHIEVEMENT_CATALOG constant: the 25-item catalog (id, name,
-//     description, icon, category, rule).
-//   - checkAchievements(userId): evaluate all 25 rules against the
-//     user's stats and insert any new unlocks. Returns the full catalog
-//     entries for the achievements that were newly unlocked so the
-//     caller can emit them to the client.
-//   - resolveMasterId(name): map a dojo opponent display name to one of
-//     the four master ids used by masterWins / the dojo achievements.
+//   - ACHIEVEMENT_CATALOG constant: the 25-item catalog.
+//   - checkAchievements(userId): evaluate all 25 rules, insert new
+//     unlocks, return the catalog entries newly unlocked.
+//   - resolveMasterId(name): map dojo opponent display name → master id.
+//
+// Chat 9: Supabase Auth migration (Option A-lite).
+//   - public.users."userId" (text) now holds a Supabase UID for new
+//     users. Legacy rows keep their old 'user_xxx' value until they
+//     migrate via migrateLegacyToken in server.js.
+//   - public.profiles (uuid PK → auth.users.id) is the new
+//     Supabase-side identity: username, avatar, is_premium.
+//   - Removed: getUserByToken, createUser (custom user + token).
+//   - Added: ensureUserRow, getProfile, updateProfileUsername,
+//     setPremium, deleteUserEverywhere, findLegacyUserIdByToken,
+//     deleteLegacyToken, migrateLegacyUser.
+//   - Every helper still takes a string userId and queries by
+//     ".eq('userId', userId)". The column type did NOT change.
 //
 // Every helper returns the SAME shape the old in-memory code produced,
 // so server.js reads almost identically. All helpers are async.
 //
 // Uses the SERVICE_ROLE key — the server is trusted. Never ship this
-// key to the client.
+// key to the client. It is also required for auth.admin.* calls
+// (deleteUserEverywhere, migrateLegacyUser).
 
 'use strict';
 
@@ -48,13 +58,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 const MAX_HISTORY = 20;
 
 // ────────────────────────────────────────────────────────────
-// Stats shape — mirrors createEmptyStats() in server.js exactly.
+// Stats shape — mirrors createEmptyStats() in db consumers.
 // Central factory so the empty object is identical everywhere.
-//
-// Chat 7 added three tracking fields used by the achievement rules:
-//   opponentsPlayed — unique opponent userIds (social / rematch rules)
-//   dailyWinDates   — 'YYYY-MM-DD' of each day with ≥1 win (perfect_week)
-//   masterWins      — per-master win counts (dojo-special rules)
 // ────────────────────────────────────────────────────────────
 function createEmptyStats() {
   return {
@@ -86,8 +91,6 @@ function emptyMasterWins() {
 }
 
 // Convert a DB row → stats object.
-// Numeric fields are copied by name; the three Chat 7 fields are
-// sanitized so a NULL / missing column never crashes callers.
 function rowToStats(row) {
   if (!row) return createEmptyStats();
 
@@ -127,44 +130,10 @@ function rowToStats(row) {
 }
 
 // ────────────────────────────────────────────────────────────
-// Users + tokens
+// Users  (public.users — game-data join target)
 // ────────────────────────────────────────────────────────────
 
-// Returns { userId, username, avatar, createdAt, token } or null.
-// Also bumps auth_tokens.lastUsedAt on hit (best-effort, non-blocking
-// on failure — a stale lastUsedAt is not worth failing login over).
-async function getUserByToken(token) {
-  if (!token) return null;
-
-  const { data, error } = await supabase
-    .from('auth_tokens')
-    .select('token, "userId", users:userId ("userId", username, avatar, "createdAt")')
-    .eq('token', token)
-    .maybeSingle();
-
-  if (error) {
-    console.error('[DB] getUserByToken error:', error.message);
-    return null;
-  }
-  if (!data || !data.users) return null;
-
-  // Fire-and-forget lastUsedAt bump.
-  supabase
-    .from('auth_tokens')
-    .update({ lastUsedAt: Date.now() })
-    .eq('token', token)
-    .then(() => {}, () => {});
-
-  return {
-    userId: data.users.userId,
-    username: data.users.username,
-    avatar: data.users.avatar,
-    createdAt: data.users.createdAt,
-    token: data.token,
-  };
-}
-
-// Returns { userId, username, avatar, createdAt } or null (no token).
+// Returns { userId, username, avatar, createdAt } or null.
 async function getUserById(userId) {
   if (!userId) return null;
 
@@ -184,7 +153,6 @@ async function getUserById(userId) {
 // Case-insensitive availability check against stored accounts only.
 // Live-player availability is checked separately in server.js against
 // the in-memory onlinePlayers map (unchanged behavior).
-// Returns true if the name is free (or only held by exceptUserId).
 async function isUsernameAvailable(name, exceptUserId) {
   const normalized = (name || '').trim().toLowerCase();
   if (!normalized) return false;
@@ -207,67 +175,8 @@ async function isUsernameAvailable(name, exceptUserId) {
   return !data || data.length === 0;
 }
 
-// Creates a fresh user + token in one logical step.
-// Returns the full account shape used by server.js:
-//   { userId, token, username, avatar, createdAt }
-// Throws on DB error so the caller can emit identityError.
-async function createUser({ userId, token, username, avatar, createdAt }) {
-  const now = createdAt || Date.now();
-
-  const { error: userErr } = await supabase
-    .from('users')
-    .insert({
-      userId,
-      username,
-      avatar,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-  if (userErr) {
-    console.error('[DB] createUser users insert error:', userErr.message);
-    throw userErr;
-  }
-
-  const { error: tokenErr } = await supabase
-    .from('auth_tokens')
-    .insert({
-      token,
-      userId,
-      createdAt: now,
-      lastUsedAt: now,
-    });
-
-  if (tokenErr) {
-    console.error('[DB] createUser auth_tokens insert error:', tokenErr.message);
-    // Roll back the user row so we don't leave an orphan.
-    await supabase.from('users').delete().eq('userId', userId);
-    throw tokenErr;
-  }
-
-  // Seed a stats row so leaderboard queries see the user immediately.
-  // Chat 7: also seed the tracking columns explicitly so they exist
-  // from row one (schema defaults cover this too — belt and braces).
-  const { error: statsErr } = await supabase
-    .from('player_stats')
-    .insert({
-      userId,
-      opponentsPlayed: [],
-      dailyWinDates: [],
-      masterWins: emptyMasterWins(),
-    });
-
-  if (statsErr) {
-    // Non-fatal: getOrCreateStats() will create it lazily. Log and move on.
-    console.error('[DB] createUser player_stats seed error:', statsErr.message);
-  }
-
-  return { userId, token, username, avatar, createdAt: now };
-}
-
 // Updates username (and optionally avatar) on the users row.
 // Caller must have already verified uniqueness.
-// Returns true on success, false on error.
 async function updateUsername(userId, username, avatar) {
   if (!userId) return false;
 
@@ -286,8 +195,7 @@ async function updateUsername(userId, username, avatar) {
   return true;
 }
 
-// Same as updateUsername but only touches avatar. Used by registerIdentity
-// when restoring a session with a changed avatar.
+// Same as updateUsername but only touches avatar.
 async function updateAvatar(userId, avatar) {
   if (!userId || !avatar) return false;
 
@@ -303,22 +211,381 @@ async function updateAvatar(userId, avatar) {
   return true;
 }
 
-// Deletes the user. FK ON DELETE CASCADE removes tokens, stats, history,
-// and achievement unlocks.
-// Returns true on success.
-async function deleteUser(userId) {
-  if (!userId) return false;
+// ────────────────────────────────────────────────────────────
+// ensureUserRow — Chat 9
+// ────────────────────────────────────────────────────────────
+// Called on every authenticated socket connect. Guarantees a
+// public.users row exists for this Supabase UID, creating one
+// lazily if not. Also seeds a player_stats row.
+//
+// `username` should already be normalized + uniqueness-checked by
+// the caller (server.js). If the user already exists, only avatar
+// is synced (username changes go through updateUsername).
+//
+// Returns the full { userId, username, avatar, createdAt } shape,
+// or null on failure.
+async function ensureUserRow(uid, { username, avatar } = {}) {
+  if (!uid) return null;
 
-  const { error } = await supabase
+  const existing = await getUserById(uid);
+  if (existing) {
+    // Sync avatar if the client sent a different one.
+    if (avatar && avatar !== existing.avatar) {
+      await updateAvatar(uid, avatar);
+      existing.avatar = avatar;
+    }
+    // Make sure a stats row exists (idempotent, cheap).
+    await getOrCreateStats(uid);
+    return existing;
+  }
+
+  const now = Date.now();
+  const finalUsername = (username && String(username).trim()) || 'Player';
+  const finalAvatar = avatar || '🤖';
+
+  const { error: userErr } = await supabase
     .from('users')
-    .delete()
-    .eq('userId', userId);
+    .insert({
+      userId: uid,
+      username: finalUsername,
+      avatar: finalAvatar,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+  if (userErr) {
+    // 23505 = unique violation. Two sockets raced; re-select.
+    if (userErr.code === '23505') {
+      const retry = await getUserById(uid);
+      if (retry) {
+        await getOrCreateStats(uid);
+        return retry;
+      }
+    }
+    console.error('[DB] ensureUserRow insert error:', userErr.message);
+    return null;
+  }
+
+  // Seed stats row. Non-fatal on failure (getOrCreateStats recreates lazily).
+  const { error: statsErr } = await supabase
+    .from('player_stats')
+    .insert({
+      userId: uid,
+      opponentsPlayed: [],
+      dailyWinDates: [],
+      masterWins: emptyMasterWins(),
+    });
+
+  if (statsErr && statsErr.code !== '23505') {
+    console.error('[DB] ensureUserRow player_stats seed error:', statsErr.message);
+  }
+
+  return {
+    userId: uid,
+    username: finalUsername,
+    avatar: finalAvatar,
+    createdAt: now,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// Profiles  (public.profiles — Supabase Auth identity)
+// ────────────────────────────────────────────────────────────
+
+// Returns { id, username, avatar, is_premium, premium_since,
+// created_at, updated_at } or null.
+async function getProfile(uid) {
+  if (!uid) return null;
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, username, avatar, is_premium, premium_since, created_at, updated_at')
+    .eq('id', uid)
+    .maybeSingle();
 
   if (error) {
-    console.error('[DB] deleteUser error:', error.message);
+    console.error('[DB] getProfile error:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+// Update profiles.username (and optionally avatar). Caller must have
+// already verified uniqueness against BOTH public.users and profiles.
+async function updateProfileUsername(uid, username, avatar) {
+  if (!uid) return false;
+
+  const patch = { username };
+  if (avatar !== undefined) patch.avatar = avatar;
+
+  const { error } = await supabase
+    .from('profiles')
+    .update(patch)
+    .eq('id', uid);
+
+  if (error) {
+    console.error('[DB] updateProfileUsername error:', error.message);
     return false;
   }
   return true;
+}
+
+// Set premium flag. Used by future payment webhook handlers.
+// `until` is a timestamp (ms) or null. Stored as timestamptz.
+async function setPremium(uid, isPremium, sinceMs) {
+  if (!uid) return false;
+
+  const patch = {
+    is_premium: !!isPremium,
+    premium_since: sinceMs ? new Date(sinceMs).toISOString() : null,
+  };
+
+  const { error } = await supabase
+    .from('profiles')
+    .update(patch)
+    .eq('id', uid);
+
+  if (error) {
+    console.error('[DB] setPremium error:', error.message);
+    return false;
+  }
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────
+// deleteUserEverywhere — Chat 9
+// ────────────────────────────────────────────────────────────
+// Deletes a user across BOTH layers:
+//   1. auth.users via admin API (cascades to profiles).
+//   2. public.users (cascades to player_stats, match_history,
+//      achievements via FKs).
+// Order matters: deleting auth.users first would cascade-drop the
+// profiles row, but public.users is independent. We do public.users
+// first, then auth, so a partial failure leaves the auth side
+// intact for a retry (the user can still sign in and try again).
+async function deleteUserEverywhere(uid) {
+  if (!uid) return false;
+
+  // 1. public.users (cascades game data).
+  const { error: pubErr } = await supabase
+    .from('users')
+    .delete()
+    .eq('userId', uid);
+
+  if (pubErr) {
+    console.error('[DB] deleteUserEverywhere public.users error:', pubErr.message);
+    return false;
+  }
+
+  // 2. auth.users (cascades profiles).
+  const { error: authErr } = await supabase.auth.admin.deleteUser(uid);
+  if (authErr) {
+    // Not fatal — public.users is gone, the account is unusable.
+    // A stale auth.users row can be cleaned up manually.
+    console.error('[DB] deleteUserEverywhere auth.admin error:', authErr.message);
+    return true;
+  }
+
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────
+// Legacy migration — Chat 9
+// ────────────────────────────────────────────────────────────
+
+// Look up the old custom userId for a legacy token.
+// Returns 'user_xxx' string or null.
+async function findLegacyUserIdByToken(token) {
+  if (!token) return null;
+
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .select('"userId"')
+    .eq('token', token)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] findLegacyUserIdByToken error:', error.message);
+    return null;
+  }
+  return data?.userId || null;
+}
+
+// Remove the legacy token row once migration succeeds.
+async function deleteLegacyToken(token) {
+  if (!token) return false;
+
+  const { error } = await supabase
+    .from('auth_tokens')
+    .delete()
+    .eq('token', token);
+
+  if (error) {
+    console.error('[DB] deleteLegacyToken error:', error.message);
+    return false;
+  }
+  return true;
+}
+
+// Migrate a legacy user from 'user_xxx' to a Supabase UID.
+//
+// Steps:
+//   1. Read the legacy public.users row.
+//   2. Create an auth.users row with a synthetic email + random
+//      password. Mark user_metadata.legacy_migrated = true and
+//      carry username/avatar so the trigger seeds profiles.
+//   3. Rewrite userId in users, player_stats, match_history,
+//      achievements from oldUserId → newUid.
+//   4. Log to migration_log.
+//   5. Return { newUid, access_token, refresh_token }.
+//      The session tokens come from a password grant against the
+//      synthetic email/password the server just set. Client will
+//      call supabase.auth.setSession() with them.
+//
+// On any failure after step 2, we attempt to clean up the newly
+// created auth user so we don't orphan it.
+async function migrateLegacyUser(oldUserId, legacyToken) {
+  if (!oldUserId) return null;
+
+  // 1. Read legacy user row (for username/avatar carry-over).
+  const legacy = await getUserById(oldUserId);
+  if (!legacy) {
+    console.error('[DB] migrateLegacyUser: no public.users row for', oldUserId);
+    return null;
+  }
+
+  // 2. Create Supabase auth user.
+  const syntheticEmail = `legacy+${oldUserId}@rps-arena.local`;
+  const randomPassword =
+    require('crypto').randomBytes(32).toString('hex');
+
+  const { data: created, error: createErr } =
+    await supabase.auth.admin.createUser({
+      email: syntheticEmail,
+      password: randomPassword,
+      email_confirm: true,
+      user_metadata: {
+        username: legacy.username,
+        avatar: legacy.avatar,
+        legacy_migrated: true,
+        legacy_user_id: oldUserId,
+      },
+    });
+
+  if (createErr || !created?.user) {
+    console.error('[DB] migrateLegacyUser createUser error:', createErr?.message);
+    return null;
+  }
+
+  const newUid = created.user.id;
+
+  // 3. Rewrite userId across the four game tables.
+  // Order matters only for FK integrity — users must be renamed
+  // LAST or the child rows would orphan. So: children first, then
+  // parent. But children have FKs pointing at the old userId, so
+  // we can't update children before the parent without breaking FK.
+  //
+  // Correct order with FKs in place:
+  //   a. Insert a new public.users row with userId = newUid.
+  //   b. Update children from oldUserId → newUid.
+  //   c. Delete the old public.users row.
+  //
+  // This keeps every FK valid at every step.
+  const now = Date.now();
+
+  const { error: newUserErr } = await supabase
+    .from('users')
+    .insert({
+      userId: newUid,
+      username: legacy.username,
+      avatar: legacy.avatar,
+      createdAt: legacy.createdAt || now,
+      updatedAt: now,
+    });
+
+  if (newUserErr) {
+    console.error('[DB] migrateLegacyUser new users insert error:', newUserErr.message);
+    // Roll back the auth user we just created.
+    await supabase.auth.admin.deleteUser(newUid).catch(() => {});
+    return null;
+  }
+
+  const childTables = [
+    { table: 'player_stats',   key: 'userId' },
+    { table: 'match_history',  key: 'userId' },
+    { table: 'achievements',   key: 'userId' },
+  ];
+
+  for (const { table, key } of childTables) {
+    const { error } = await supabase
+      .from(table)
+      .update({ [key]: newUid })
+      .eq(key, oldUserId);
+    if (error) {
+      console.error(`[DB] migrateLegacyUser ${table} rewrite error:`, error.message);
+      // Best-effort: leave the new row + auth user in place so a
+      // retry can finish. Return null to signal failure.
+      return null;
+    }
+  }
+
+  // c. Delete old public.users row. FK cascade would take children
+  //    if any remained, but they were all rewritten above.
+  const { error: delOldErr } = await supabase
+    .from('users')
+    .delete()
+    .eq('userId', oldUserId);
+
+  if (delOldErr) {
+    console.error('[DB] migrateLegacyUser old users delete error:', delOldErr.message);
+    // Non-fatal — the old row is now unreferenced.
+  }
+
+  // 4. Log.
+  await supabase
+    .from('migration_log')
+    .insert({
+      old_user_id: oldUserId,
+      new_uid: newUid,
+      legacy_token: legacyToken || null,
+    })
+    .then(() => {}, (e) =>
+      console.error('[DB] migration_log insert error:', e?.message)
+    );
+
+  // 5. Get session tokens via password grant.
+  //    Use a separate client so we don't pollute the service-role
+  //    client's state with a user session.
+  const { createClient: createAnonClient } = require('@supabase/supabase-js');
+  const anonClient = createAnonClient(
+    SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY,
+    { auth: { persistSession: false, autoRefreshToken: false } }
+  );
+
+  const { data: session, error: signErr } =
+    await anonClient.auth.signInWithPassword({
+      email: syntheticEmail,
+      password: randomPassword,
+    });
+
+  if (signErr || !session?.session) {
+    console.error('[DB] migrateLegacyUser password grant error:', signErr?.message);
+    // Auth user + rewritten rows exist; migration is functional but
+    // the client didn't get a session. Return what we have so the
+    // caller can still complete the connect, or fail loudly.
+    return {
+      newUid,
+      access_token: null,
+      refresh_token: null,
+    };
+  }
+
+  return {
+    newUid,
+    access_token: session.session.access_token,
+    refresh_token: session.session.refresh_token,
+  };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -326,7 +593,6 @@ async function deleteUser(userId) {
 // ────────────────────────────────────────────────────────────
 
 // Fetch stats, creating the row if it doesn't exist (lazy init).
-// Always returns a full stats object.
 async function getOrCreateStats(userId) {
   if (!userId) return createEmptyStats();
 
@@ -342,12 +608,10 @@ async function getOrCreateStats(userId) {
   }
   if (data) return rowToStats(data);
 
-  // Missing — create it. ON CONFLICT DO NOTHING handles the race.
   const { error: insErr } = await supabase
     .from('player_stats')
     .insert({ userId });
 
-  // 23505 = unique violation — someone else just created it, fine.
   if (insErr && insErr.code !== '23505') {
     console.error('[DB] getOrCreateStats insert error:', insErr.message);
     return createEmptyStats();
@@ -366,11 +630,7 @@ async function getOrCreateStats(userId) {
   return rowToStats(created);
 }
 
-// Persist a full stats object. Caller mutates a local copy then writes
-// it back with this function — mirrors the old playerStats.set() pattern.
-//
-// Chat 7: the three tracking fields ride along on the same upsert. They
-// are plain JS values that Supabase serializes to text[] / jsonb.
+// Persist a full stats object.
 async function saveStats(userId, stats) {
   if (!userId) return false;
 
@@ -382,7 +642,6 @@ async function saveStats(userId, stats) {
       {
         userId,
         ...safe,
-        // Defensive: never write undefined/null into these columns.
         opponentsPlayed: Array.isArray(safe.opponentsPlayed)
           ? safe.opponentsPlayed
           : [],
@@ -408,9 +667,6 @@ async function saveStats(userId, stats) {
 // Match history
 // ────────────────────────────────────────────────────────────
 
-// Append a match row, then trim the user's history to MAX_HISTORY.
-// The match object uses the exact shape server.js already builds:
-//   { mode, opponent, opponentId, result, myScore, theirScore, rounds, timestamp }
 async function appendMatch(userId, match) {
   if (!userId || !match) return false;
 
@@ -433,8 +689,6 @@ async function appendMatch(userId, match) {
     return false;
   }
 
-  // Trim: find ids of the newest MAX_HISTORY rows, delete the rest.
-  // Two-step (select ids, then delete) to avoid needing a subquery.
   const { data: keep, error: selErr } = await supabase
     .from('match_history')
     .select('id')
@@ -443,15 +697,10 @@ async function appendMatch(userId, match) {
     .limit(MAX_HISTORY);
 
   if (selErr || !keep) {
-    // Non-fatal — history will just grow slightly. Log and move on.
     console.error('[DB] appendMatch trim select error:', selErr?.message);
     return true;
   }
 
-  const keepIds = keep.map((r) => r.id);
-
-  // Delete anything older than the cutoff timestamp. Simpler and safe
-  // than a NOT IN (...) with 20 uuids.
   const oldestKept = keep[keep.length - 1];
   if (!oldestKept) return true;
 
@@ -476,9 +725,6 @@ async function appendMatch(userId, match) {
   return true;
 }
 
-// Returns the user's matches, newest first, max MAX_HISTORY.
-// Shape matches the old in-memory array exactly:
-//   { mode, opponent, opponentId, result, myScore, theirScore, rounds, timestamp }
 async function getMatchHistory(userId) {
   if (!userId) return [];
 
@@ -500,9 +746,6 @@ async function getMatchHistory(userId) {
 // Leaderboard
 // ────────────────────────────────────────────────────────────
 
-// Pulls all stats rows joined with users, then server.js sorts/slices
-// into the three top-20 lists exactly as before.
-// Returns: array of { userId, username, avatar, ...stats }
 async function listStatsWithUsers() {
   const { data, error } = await supabase
     .from('player_stats')
@@ -532,12 +775,6 @@ async function listStatsWithUsers() {
 // ACHIEVEMENTS (Chat 7 — roadmap item #4)
 // ────────────────────────────────────────────────────────────
 
-// The full 25-item catalog. Keep ids stable — they are the primary key
-// half in the achievements table. `rule` is a human-readable string for
-// the client; the actual evaluation lives in checkAchievements().
-//
-// Category strings are used by the client to group badges.
-//   progression | streaks | mode | dojo | volume | social
 const ACHIEVEMENT_CATALOG = [
   // ── Progression (5) ──
   { id: 'first_win',         name: 'First Win',         icon: '🥇', category: 'progression', rule: 'wins >= 1',            description: 'Win your first match.' },
@@ -577,18 +814,12 @@ const ACHIEVEMENT_CATALOG = [
   { id: 'rematch_king',      name: 'Rematch King',      icon: '🔁', category: 'social',      rule: 'played 10 rematches',  description: 'Play 10 rematches.' },
 ];
 
-// Fast lookup by id.
 const ACHIEVEMENT_BY_ID = Object.fromEntries(
   ACHIEVEMENT_CATALOG.map((a) => [a.id, a])
 );
 
-// Master ids recognized by masterWins + the dojo achievements.
 const MASTER_IDS = ['rookie', 'tactician', 'hunter', 'grandmaster'];
 
-// Map a dojo opponent display name ("Rookie", "The Grandmaster",
-// "Master Hunter", …) to a master id. Case-insensitive substring match
-// so small display-name variations don't break the rule.
-// Returns null if nothing matches (in which case masterWins is untouched).
 function resolveMasterId(name) {
   if (!name || typeof name !== 'string') return null;
   const lower = name.toLowerCase();
@@ -598,7 +829,6 @@ function resolveMasterId(name) {
   return null;
 }
 
-// Local helper — 'YYYY-MM-DD' for a timestamp (local server time).
 function dateKey(ts) {
   const d = new Date(ts);
   const y = d.getFullYear();
@@ -607,8 +837,6 @@ function dateKey(ts) {
   return `${y}-${m}-${day}`;
 }
 
-// Does dailyWinDates contain 7 consecutive calendar days ending anywhere
-// in the array? Cheap: sort unique dates, then scan for a run of 7.
 function hasSevenDayWinStreak(dates) {
   if (!Array.isArray(dates) || dates.length < 7) return false;
 
@@ -637,12 +865,6 @@ function hasSevenDayWinStreak(dates) {
   return false;
 }
 
-// Count how many opponents have been faced more than once.
-// opponentsPlayed is a *unique* list, so we can't count rematches from
-// it alone. We approximate: rematch_king is satisfied when the user has
-// played at least 10 more total matches than unique opponents, i.e.
-// total - opponentsPlayed.length >= 10. This is intentionally simple;
-// see the "fix later" note about switching to a real rematch counter.
 function rematchCountApprox(stats) {
   const unique = Array.isArray(stats.opponentsPlayed)
     ? stats.opponentsPlayed.length
@@ -652,9 +874,6 @@ function rematchCountApprox(stats) {
   return diff > 0 ? diff : 0;
 }
 
-// Evaluate every rule against a stats object.
-// Returns the subset of catalog entries whose rules are satisfied.
-// Pure — no DB access. checkAchievements() handles persistence.
 function evaluateRules(stats) {
   const s = stats || {};
   const wins = s.wins || 0;
@@ -718,8 +937,6 @@ function evaluateRules(stats) {
   return ACHIEVEMENT_CATALOG.filter((a) => rules[a.id]);
 }
 
-// Returns a map { achievementId: unlockedAt } for everything this user
-// has already unlocked. Empty object on error (caller treats as "none").
 async function getUnlockedMap(userId) {
   if (!userId) return {};
 
@@ -740,16 +957,6 @@ async function getUnlockedMap(userId) {
   return map;
 }
 
-// Main entry. Reads the user's stats, evaluates all 25 rules, and
-// inserts any newly-satisfied achievements.
-//
-// Idempotent: the achievements table PK (userId, achievementId) plus
-// ON CONFLICT DO NOTHING means a re-run inserts nothing.
-//
-// Returns an ARRAY of catalog entries (id, name, description, icon,
-// category, rule) for the achievements unlocked by THIS call — empty
-// array if none. On any DB failure, returns [] and logs; it never
-// throws, so callers can fire-and-forget.
 async function checkAchievements(userId) {
   if (!userId) return [];
 
@@ -804,14 +1011,25 @@ module.exports = {
   supabase,
   createEmptyStats,
 
-  // users / tokens
-  getUserByToken,
+  // users
   getUserById,
   isUsernameAvailable,
-  createUser,
   updateUsername,
   updateAvatar,
-  deleteUser,
+  ensureUserRow,
+
+  // profiles (Chat 9)
+  getProfile,
+  updateProfileUsername,
+  setPremium,
+
+  // deletion (Chat 9)
+  deleteUserEverywhere,
+
+  // legacy migration (Chat 9)
+  findLegacyUserIdByToken,
+  deleteLegacyToken,
+  migrateLegacyUser,
 
   // stats
   getOrCreateStats,
@@ -831,6 +1049,5 @@ module.exports = {
   getUnlockedMap,
   resolveMasterId,
   dateKey,
-  // exported for potential client-side mirroring / tests
   evaluateRules,
 };
