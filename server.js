@@ -6,16 +6,12 @@
 // Chat 5: Dojo stats sync. Chat 7: achievements.
 // Chat 9: Supabase Auth migration (JWT middleware, identify,
 //         migrateLegacyToken, deleteUserEverywhere).
-// Chat 9b:
-//   - Avatar socket events (getAvatars, createAvatar, updateAvatar,
-//     deleteAvatar, selectAvatar).
-//   - identify uses profiles.username / profiles.avatar, not
-//     client-sent values.
-//   - searchPlayer uses profiles.username.
-//   - Match start snapshots each player's selected avatar onto the
-//     room; match end applies W/L to that avatar.
-//   - Dojo [DOJO MATCH] log with verified new stats.
-//   - changeUsername receive log.
+// Chat 9b: avatars (getAvatars/createAvatar/updateAvatar/deleteAvatar/
+//          selectAvatar), profiles-driven identify, snapshot avatars
+//          at match start, dojo log, changeUsername receive log.
+// Chat 9c: ES256-only JWT verification via Supabase JWKS (jose).
+//          - Removed jsonwebtoken and SUPABASE_JWT_SECRET.
+//          - HS256 and every other alg are rejected.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -25,8 +21,8 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
+const { createRemoteJWKSet, jwtVerify, decodeProtectedHeader } = require('jose');
 const { createAdaptiveAI } = require('./aiEngine');
 const db = require('./db');
 
@@ -39,11 +35,44 @@ const io = new Server(server, {
 });
 
 // ─── Env ───
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
-if (!SUPABASE_JWT_SECRET) {
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+if (!SUPABASE_URL) {
   console.error(
-    '[SERVER] Missing SUPABASE_JWT_SECRET. Set it on Render ' +
-    '(Supabase dashboard → Settings → API → JWT Secret).'
+    '[SERVER] Missing SUPABASE_URL. Set it on Render ' +
+    '(Supabase dashboard → Settings → API → Project URL).'
+  );
+}
+
+if (!SUPABASE_ANON_KEY) {
+  console.error(
+    '[SERVER] Missing SUPABASE_ANON_KEY. Set it on Render ' +
+    '(Supabase dashboard → Settings → API → anon public key). ' +
+    'Required for the JWKS fetch.'
+  );
+}
+
+// ─── Supabase JWKS (ES256 verification) ───
+// jose caches keys internally and refreshes on demand.
+// The apikey header is required by Supabase's auth gateway.
+const SUPABASE_JWKS_URL = SUPABASE_URL
+  ? `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`
+  : null;
+
+let jwks = null;
+if (SUPABASE_JWKS_URL && SUPABASE_ANON_KEY) {
+  jwks = createRemoteJWKSet(new URL(SUPABASE_JWKS_URL), {
+    headers: { apikey: SUPABASE_ANON_KEY },
+    // Cooldown between refresh attempts when a kid isn't found.
+    cooldownDuration: 10_000,
+    // Cache the JWKS in memory between refreshes.
+    cacheMaxAge: 10 * 60 * 1000,
+  });
+  console.log('[JWT] JWKS configured:', SUPABASE_JWKS_URL);
+} else {
+  console.warn(
+    '[JWT] JWKS not configured. All authenticated sockets will be rejected.'
   );
 }
 
@@ -311,9 +340,7 @@ function trackMasterWin(stats, masterId) {
   stats.masterWins[masterId] = (stats.masterWins[masterId] || 0) + 1;
 }
 
-// ─── Snapshot selected avatars at room start (Chat 9b) ───
-// Called when both players are known. Stores { [socketId]: avatarId }
-// on room.avatarIds. Looked up from DB (is_selected=true).
+// ─── Snapshot selected avatars at room start ───
 async function snapshotRoomAvatars(room) {
   if (!room) return;
   room.avatarIds = {};
@@ -470,7 +497,7 @@ async function recordMatchResult(room) {
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:',
     room.winner === p1 ? p1Name : p2Name, `(${mode})`);
 
-  // ── Chat 9b: apply W/L to each player's selected avatar ──
+  // ── Avatar W/L ──
   if (room.avatarIds) {
     const p1AvatarId = room.avatarIds[p1];
     const p2AvatarId = room.avatarIds[p2];
@@ -733,14 +760,30 @@ function startAvatarAutoPlay(roomCode) {
 }
 
 // ════════════════════════════════════════════════════════════
-// JWT middleware
+// JWT middleware — ES256-only via Supabase JWKS (jose)
 // ════════════════════════════════════════════════════════════
-io.use((socket, next) => {
+//
+// Flow:
+//   1. Read auth.token from the handshake.
+//   2. Decode the JWT header (no verification) to read `alg`.
+//   3. Reject anything that isn't ES256 with a clear reason.
+//   4. Verify ES256 against the cached Supabase JWKS.
+//   5. Extract sub → socket.data.userId.
+//
+// Legacy migration: a socket that presents auth.legacyToken (and no
+// auth.token) is allowed to connect with userId=null so it can run
+// migrateLegacyToken.
+//
+// All other sockets must present a valid ES256 JWT or they're
+// rejected at handshake time.
+
+io.use(async (socket, next) => {
   const auth = socket.handshake.auth || {};
   const token = typeof auth.token === 'string' ? auth.token : null;
   const legacyToken =
     typeof auth.legacyToken === 'string' ? auth.legacyToken : null;
 
+  // Legacy-only socket: allow connect, but userId stays null.
   if (!token && legacyToken) {
     socket.data.userId = null;
     socket.data.legacyOnly = true;
@@ -748,22 +791,47 @@ io.use((socket, next) => {
   }
 
   if (!token) {
+    // No auth at all. Allow the connect; handlers guard on userId.
     socket.data.userId = null;
     return next();
   }
 
+  if (!jwks) {
+    console.error('[JWT] reject: JWKS not configured');
+    return next(new Error('jwks-not-configured'));
+  }
+
+  // 1. Peek at the header to decide the algorithm.
+  let header;
   try {
-    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET, {
-      algorithms: ['HS256'],
+    header = decodeProtectedHeader(token);
+  } catch (e) {
+    console.error('[JWT] reject: malformed token header');
+    return next(new Error('invalid-jwt-header'));
+  }
+
+  const alg = header?.alg;
+  if (alg !== 'ES256') {
+    console.error('[JWT] reject: unsupported alg', alg);
+    return next(new Error(`unsupported-jwt-alg:${alg || 'none'}`));
+  }
+
+  // 2. Verify against the JWKS.
+  try {
+    const { payload } = await jwtVerify(token, jwks, {
+      algorithms: ['ES256'],
     });
-    if (!decoded?.sub) {
+
+    if (!payload?.sub) {
+      console.error('[JWT] reject: no sub in payload');
       return next(new Error('invalid-jwt-no-sub'));
     }
-    socket.data.userId = String(decoded.sub);
-    socket.data.jwtPayload = decoded;
+
+    socket.data.userId = String(payload.sub);
+    socket.data.jwtPayload = payload;
     return next();
   } catch (e) {
-    console.error('[JWT] verify failed:', e?.message);
+    console.error('[JWT] verify failed:', e?.code || e?.message);
     return next(new Error('invalid-jwt'));
   }
 });
@@ -791,11 +859,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // 1. Ensure public.users row exists.
-    //    Priority order for username:
-    //      a. profiles.username (server-side truth)
-    //      b. client-supplied (fallback for fresh users)
-    //      c. 'Player' + suffix
     const profile = await db.getProfile(uid);
     const clientUsernameRaw = (data?.username || '').trim().slice(0, 15);
     const clientAvatar = data?.avatar || null;
@@ -808,7 +871,6 @@ io.on('connection', (socket) => {
       }
     }
     if (!usernameToUse) {
-      // Fresh user with no profile username and no client-supplied name.
       const base = 'player';
       usernameToUse = await generateUniqueUsername(base, uid);
     }
@@ -825,12 +887,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // 2. Sync profile row if it was missing a username.
     if (!profile?.username) {
       db.updateProfileUsername(uid, user.username, user.avatar).catch(() => {});
     }
 
-    // 3. Session replacement.
     for (const [existingSocketId, existingPlayer] of onlinePlayers) {
       if (existingPlayer.userId === uid && existingSocketId !== socket.id) {
         console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${uid})`);
@@ -846,7 +906,6 @@ io.on('connection', (socket) => {
       }
     }
 
-    // 4. Populate maps.
     const player = players.get(socket.id);
     if (player) {
       player.name = user.username;
@@ -871,7 +930,6 @@ io.on('connection', (socket) => {
     const stats = await db.getOrCreateStats(uid);
     socket.emit('playerStats', { stats });
 
-    // 5. Load avatars and send them.
     let avatars = [];
     try {
       avatars = await db.listAvatars(uid);
@@ -880,7 +938,6 @@ io.on('connection', (socket) => {
     }
     socket.emit('avatars', { avatars });
 
-    // 6. Send selfRegistered.
     const payload = socket.data.jwtPayload || {};
     const meta = payload.user_metadata || {};
     const isAnonymous = !payload.email || meta.is_anonymous === true;
@@ -1119,7 +1176,7 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // AVATARS (Chat 9b)
+  // AVATARS
   // ────────────────────────────────────────────────────────────
 
   socket.on('getAvatars', async () => {
@@ -1146,7 +1203,6 @@ io.on('connection', (socket) => {
         return;
       }
       socket.emit('avatarCreated', { avatar: created });
-      // Push the full list so the client always stays in sync.
       const avatars = await db.listAvatars(uid);
       socket.emit('avatars', { avatars });
     } catch (e) {
@@ -1298,7 +1354,7 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // searchPlayer — uses profiles.username
+  // searchPlayer
   // ────────────────────────────────────────────────────────────
   socket.on('searchPlayer', async (data) => {
     const target = normalizeUsername(data.username || '');
@@ -1307,7 +1363,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Live search first.
     for (const [socketId, player] of onlinePlayers) {
       if (socketId === socket.id) continue;
       if (player.username === target) {
@@ -1323,7 +1378,6 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Fallback: DB lookup via profiles.username (case-insensitive).
     const { data: profile } = await db.supabase
       .from('profiles')
       .select('id, username')
@@ -1459,7 +1513,6 @@ io.on('connection', (socket) => {
         ensureAvatarAI(room);
       }
 
-      // Snapshot selected avatars for the W/L update at match end.
       await snapshotRoomAvatars(room);
 
       io.to(invite.fromId).emit('inviteAccepted', {
