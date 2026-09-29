@@ -2,40 +2,20 @@
 //
 // RPS Arena — Supabase persistence layer.
 //
-// Chat 4: replaces the four in-memory Maps that used to live in server.js:
-//   userAccounts      → users + auth_tokens
-//   accountsByUserId  → users + auth_tokens
-//   playerStats       → player_stats
-//   matchHistory      → match_history
-//
-// Chat 7: achievements (roadmap item #4).
-//   - New table `achievements` (userId, achievementId, unlockedAt).
-//   - New player_stats columns: opponentsPlayed text[], dailyWinDates
-//     text[], masterWins jsonb.
-//   - ACHIEVEMENT_CATALOG constant: the 25-item catalog.
-//   - checkAchievements(userId): evaluate all 25 rules, insert new
-//     unlocks, return the catalog entries newly unlocked.
-//   - resolveMasterId(name): map dojo opponent display name → master id.
-//
+// Chat 4: users + tokens + stats + history.
+// Chat 7: achievements.
 // Chat 9: Supabase Auth migration (Option A-lite).
-//   - public.users."userId" (text) now holds a Supabase UID for new
-//     users. Legacy rows keep their old 'user_xxx' value until they
-//     migrate via migrateLegacyToken in server.js.
-//   - public.profiles (uuid PK → auth.users.id) is the new
-//     Supabase-side identity: username, avatar, is_premium.
-//   - Removed: getUserByToken, createUser (custom user + token).
-//   - Added: ensureUserRow, getProfile, updateProfileUsername,
-//     setPremium, deleteUserEverywhere, findLegacyUserIdByToken,
-//     deleteLegacyToken, migrateLegacyUser.
-//   - Every helper still takes a string userId and queries by
-//     ".eq('userId', userId)". The column type did NOT change.
-//
-// Every helper returns the SAME shape the old in-memory code produced,
-// so server.js reads almost identically. All helpers are async.
+// Chat 9b: avatars.
+// Chat 9b (revised):
+//   - rowToAvatar mirrors the client Avatar interface exactly, including
+//     xp, titles, winStreak.
+//   - createAvatar writes xp / titles / win_streak.
+//   - updateAvatar accepts xp, titles, winStreak edits.
+//   - recordAvatarResult updates both win_streak (current) and
+//     best_streak (record) on a win.
 //
 // Uses the SERVICE_ROLE key — the server is trusted. Never ship this
-// key to the client. It is also required for auth.admin.* calls
-// (deleteUserEverywhere, migrateLegacyUser).
+// key to the client.
 
 'use strict';
 
@@ -58,8 +38,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 const MAX_HISTORY = 20;
 
 // ────────────────────────────────────────────────────────────
-// Stats shape — mirrors createEmptyStats() in db consumers.
-// Central factory so the empty object is identical everywhere.
+// Stats shape
 // ────────────────────────────────────────────────────────────
 function createEmptyStats() {
   return {
@@ -78,19 +57,16 @@ function createEmptyStats() {
     dojoTies: 0,
     currentStreak: 0,
     bestStreak: 0,
-    // Chat 7 tracking
     opponentsPlayed: [],
     dailyWinDates: [],
     masterWins: { rookie: 0, tactician: 0, hunter: 0, grandmaster: 0 },
   };
 }
 
-// Shape used when a masterWins column is missing or malformed.
 function emptyMasterWins() {
   return { rookie: 0, tactician: 0, hunter: 0, grandmaster: 0 };
 }
 
-// Convert a DB row → stats object.
 function rowToStats(row) {
   if (!row) return createEmptyStats();
 
@@ -103,7 +79,6 @@ function rowToStats(row) {
     if (typeof row[k] === 'number') out[k] = row[k];
   }
 
-  // Arrays: accept text[] or JSON array, else default to [].
   if (Array.isArray(row.opponentsPlayed)) {
     out.opponentsPlayed = row.opponentsPlayed.filter(
       (v) => typeof v === 'string' && v.length > 0
@@ -115,7 +90,6 @@ function rowToStats(row) {
     );
   }
 
-  // masterWins: jsonb → object. Coerce each key to a non-negative int.
   const mw = row.masterWins;
   if (mw && typeof mw === 'object' && !Array.isArray(mw)) {
     const base = emptyMasterWins();
@@ -130,10 +104,8 @@ function rowToStats(row) {
 }
 
 // ────────────────────────────────────────────────────────────
-// Users  (public.users — game-data join target)
+// Users
 // ────────────────────────────────────────────────────────────
-
-// Returns { userId, username, avatar, createdAt } or null.
 async function getUserById(userId) {
   if (!userId) return null;
 
@@ -150,9 +122,6 @@ async function getUserById(userId) {
   return data || null;
 }
 
-// Case-insensitive availability check against stored accounts only.
-// Live-player availability is checked separately in server.js against
-// the in-memory onlinePlayers map (unchanged behavior).
 async function isUsernameAvailable(name, exceptUserId) {
   const normalized = (name || '').trim().toLowerCase();
   if (!normalized) return false;
@@ -169,14 +138,11 @@ async function isUsernameAvailable(name, exceptUserId) {
   const { data, error } = await q.limit(1);
   if (error) {
     console.error('[DB] isUsernameAvailable error:', error.message);
-    // Fail closed — if we can't verify, treat as taken to avoid dupes.
     return false;
   }
   return !data || data.length === 0;
 }
 
-// Updates username (and optionally avatar) on the users row.
-// Caller must have already verified uniqueness.
 async function updateUsername(userId, username, avatar) {
   if (!userId) return false;
 
@@ -195,8 +161,10 @@ async function updateUsername(userId, username, avatar) {
   return true;
 }
 
-// Same as updateUsername but only touches avatar.
-async function updateAvatar(userId, avatar) {
+// User-level avatar (the single emoji profile avatar, not the avatars
+// table). Kept separate from updateAvatar (avatar-level) to avoid a
+// name collision.
+async function updateUserAvatar(userId, avatar) {
   if (!userId || !avatar) return false;
 
   const { error } = await supabase
@@ -205,36 +173,21 @@ async function updateAvatar(userId, avatar) {
     .eq('userId', userId);
 
   if (error) {
-    console.error('[DB] updateAvatar error:', error.message);
+    console.error('[DB] updateUserAvatar error:', error.message);
     return false;
   }
   return true;
 }
 
-// ────────────────────────────────────────────────────────────
-// ensureUserRow — Chat 9
-// ────────────────────────────────────────────────────────────
-// Called on every authenticated socket connect. Guarantees a
-// public.users row exists for this Supabase UID, creating one
-// lazily if not. Also seeds a player_stats row.
-//
-// `username` should already be normalized + uniqueness-checked by
-// the caller (server.js). If the user already exists, only avatar
-// is synced (username changes go through updateUsername).
-//
-// Returns the full { userId, username, avatar, createdAt } shape,
-// or null on failure.
 async function ensureUserRow(uid, { username, avatar } = {}) {
   if (!uid) return null;
 
   const existing = await getUserById(uid);
   if (existing) {
-    // Sync avatar if the client sent a different one.
     if (avatar && avatar !== existing.avatar) {
-      await updateAvatar(uid, avatar);
+      await updateUserAvatar(uid, avatar);
       existing.avatar = avatar;
     }
-    // Make sure a stats row exists (idempotent, cheap).
     await getOrCreateStats(uid);
     return existing;
   }
@@ -254,7 +207,6 @@ async function ensureUserRow(uid, { username, avatar } = {}) {
     });
 
   if (userErr) {
-    // 23505 = unique violation. Two sockets raced; re-select.
     if (userErr.code === '23505') {
       const retry = await getUserById(uid);
       if (retry) {
@@ -266,7 +218,6 @@ async function ensureUserRow(uid, { username, avatar } = {}) {
     return null;
   }
 
-  // Seed stats row. Non-fatal on failure (getOrCreateStats recreates lazily).
   const { error: statsErr } = await supabase
     .from('player_stats')
     .insert({
@@ -289,11 +240,8 @@ async function ensureUserRow(uid, { username, avatar } = {}) {
 }
 
 // ────────────────────────────────────────────────────────────
-// Profiles  (public.profiles — Supabase Auth identity)
+// Profiles
 // ────────────────────────────────────────────────────────────
-
-// Returns { id, username, avatar, is_premium, premium_since,
-// created_at, updated_at } or null.
 async function getProfile(uid) {
   if (!uid) return null;
 
@@ -310,8 +258,6 @@ async function getProfile(uid) {
   return data || null;
 }
 
-// Update profiles.username (and optionally avatar). Caller must have
-// already verified uniqueness against BOTH public.users and profiles.
 async function updateProfileUsername(uid, username, avatar) {
   if (!uid) return false;
 
@@ -330,8 +276,6 @@ async function updateProfileUsername(uid, username, avatar) {
   return true;
 }
 
-// Set premium flag. Used by future payment webhook handlers.
-// `until` is a timestamp (ms) or null. Stored as timestamptz.
 async function setPremium(uid, isPremium, sinceMs) {
   if (!uid) return false;
 
@@ -353,20 +297,11 @@ async function setPremium(uid, isPremium, sinceMs) {
 }
 
 // ────────────────────────────────────────────────────────────
-// deleteUserEverywhere — Chat 9
+// deleteUserEverywhere
 // ────────────────────────────────────────────────────────────
-// Deletes a user across BOTH layers:
-//   1. auth.users via admin API (cascades to profiles).
-//   2. public.users (cascades to player_stats, match_history,
-//      achievements via FKs).
-// Order matters: deleting auth.users first would cascade-drop the
-// profiles row, but public.users is independent. We do public.users
-// first, then auth, so a partial failure leaves the auth side
-// intact for a retry (the user can still sign in and try again).
 async function deleteUserEverywhere(uid) {
   if (!uid) return false;
 
-  // 1. public.users (cascades game data).
   const { error: pubErr } = await supabase
     .from('users')
     .delete()
@@ -377,11 +312,8 @@ async function deleteUserEverywhere(uid) {
     return false;
   }
 
-  // 2. auth.users (cascades profiles).
   const { error: authErr } = await supabase.auth.admin.deleteUser(uid);
   if (authErr) {
-    // Not fatal — public.users is gone, the account is unusable.
-    // A stale auth.users row can be cleaned up manually.
     console.error('[DB] deleteUserEverywhere auth.admin error:', authErr.message);
     return true;
   }
@@ -390,11 +322,8 @@ async function deleteUserEverywhere(uid) {
 }
 
 // ────────────────────────────────────────────────────────────
-// Legacy migration — Chat 9
+// Legacy migration
 // ────────────────────────────────────────────────────────────
-
-// Look up the old custom userId for a legacy token.
-// Returns 'user_xxx' string or null.
 async function findLegacyUserIdByToken(token) {
   if (!token) return null;
 
@@ -411,7 +340,6 @@ async function findLegacyUserIdByToken(token) {
   return data?.userId || null;
 }
 
-// Remove the legacy token row once migration succeeds.
 async function deleteLegacyToken(token) {
   if (!token) return false;
 
@@ -427,34 +355,15 @@ async function deleteLegacyToken(token) {
   return true;
 }
 
-// Migrate a legacy user from 'user_xxx' to a Supabase UID.
-//
-// Steps:
-//   1. Read the legacy public.users row.
-//   2. Create an auth.users row with a synthetic email + random
-//      password. Mark user_metadata.legacy_migrated = true and
-//      carry username/avatar so the trigger seeds profiles.
-//   3. Rewrite userId in users, player_stats, match_history,
-//      achievements from oldUserId → newUid.
-//   4. Log to migration_log.
-//   5. Return { newUid, access_token, refresh_token }.
-//      The session tokens come from a password grant against the
-//      synthetic email/password the server just set. Client will
-//      call supabase.auth.setSession() with them.
-//
-// On any failure after step 2, we attempt to clean up the newly
-// created auth user so we don't orphan it.
 async function migrateLegacyUser(oldUserId, legacyToken) {
   if (!oldUserId) return null;
 
-  // 1. Read legacy user row (for username/avatar carry-over).
   const legacy = await getUserById(oldUserId);
   if (!legacy) {
     console.error('[DB] migrateLegacyUser: no public.users row for', oldUserId);
     return null;
   }
 
-  // 2. Create Supabase auth user.
   const syntheticEmail = `legacy+${oldUserId}@rps-arena.local`;
   const randomPassword =
     require('crypto').randomBytes(32).toString('hex');
@@ -478,19 +387,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
   }
 
   const newUid = created.user.id;
-
-  // 3. Rewrite userId across the four game tables.
-  // Order matters only for FK integrity — users must be renamed
-  // LAST or the child rows would orphan. So: children first, then
-  // parent. But children have FKs pointing at the old userId, so
-  // we can't update children before the parent without breaking FK.
-  //
-  // Correct order with FKs in place:
-  //   a. Insert a new public.users row with userId = newUid.
-  //   b. Update children from oldUserId → newUid.
-  //   c. Delete the old public.users row.
-  //
-  // This keeps every FK valid at every step.
   const now = Date.now();
 
   const { error: newUserErr } = await supabase
@@ -505,7 +401,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 
   if (newUserErr) {
     console.error('[DB] migrateLegacyUser new users insert error:', newUserErr.message);
-    // Roll back the auth user we just created.
     await supabase.auth.admin.deleteUser(newUid).catch(() => {});
     return null;
   }
@@ -523,14 +418,21 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
       .eq(key, oldUserId);
     if (error) {
       console.error(`[DB] migrateLegacyUser ${table} rewrite error:`, error.message);
-      // Best-effort: leave the new row + auth user in place so a
-      // retry can finish. Return null to signal failure.
       return null;
     }
   }
 
-  // c. Delete old public.users row. FK cascade would take children
-  //    if any remained, but they were all rewritten above.
+  // avatars also belong to the user — rewrite them too.
+  const { error: avatarsErr } = await supabase
+    .from('avatars')
+    .update({ userId: newUid })
+    .eq('userId', oldUserId);
+
+  if (avatarsErr) {
+    console.error('[DB] migrateLegacyUser avatars rewrite error:', avatarsErr.message);
+    // Non-fatal — legacy users likely have no server avatars anyway.
+  }
+
   const { error: delOldErr } = await supabase
     .from('users')
     .delete()
@@ -538,10 +440,8 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 
   if (delOldErr) {
     console.error('[DB] migrateLegacyUser old users delete error:', delOldErr.message);
-    // Non-fatal — the old row is now unreferenced.
   }
 
-  // 4. Log.
   await supabase
     .from('migration_log')
     .insert({
@@ -553,9 +453,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
       console.error('[DB] migration_log insert error:', e?.message)
     );
 
-  // 5. Get session tokens via password grant.
-  //    Use a separate client so we don't pollute the service-role
-  //    client's state with a user session.
   const { createClient: createAnonClient } = require('@supabase/supabase-js');
   const anonClient = createAnonClient(
     SUPABASE_URL,
@@ -571,9 +468,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 
   if (signErr || !session?.session) {
     console.error('[DB] migrateLegacyUser password grant error:', signErr?.message);
-    // Auth user + rewritten rows exist; migration is functional but
-    // the client didn't get a session. Return what we have so the
-    // caller can still complete the connect, or fail loudly.
     return {
       newUid,
       access_token: null,
@@ -591,8 +485,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 // ────────────────────────────────────────────────────────────
 // Stats
 // ────────────────────────────────────────────────────────────
-
-// Fetch stats, creating the row if it doesn't exist (lazy init).
 async function getOrCreateStats(userId) {
   if (!userId) return createEmptyStats();
 
@@ -630,9 +522,8 @@ async function getOrCreateStats(userId) {
   return rowToStats(created);
 }
 
-// Persist a full stats object.
 async function saveStats(userId, stats) {
-  if (!userId) return false;
+  if (!userId) return null;
 
   const safe = stats && typeof stats === 'object' ? stats : {};
 
@@ -657,16 +548,32 @@ async function saveStats(userId, stats) {
     );
 
   if (error) {
-    console.error('[DB] saveStats error:', error.message);
-    return false;
+    console.error('[DB] saveStats error:', error.message, '| userId:', userId);
+    return null;
   }
-  return true;
+
+  const { data, error: readErr } = await supabase
+    .from('player_stats')
+    .select('*')
+    .eq('userId', userId)
+    .maybeSingle();
+
+  if (readErr || !data) {
+    console.error(
+      '[DB] saveStats read-back failed:',
+      readErr?.message,
+      '| userId:',
+      userId
+    );
+    return null;
+  }
+
+  return rowToStats(data);
 }
 
 // ────────────────────────────────────────────────────────────
 // Match history
 // ────────────────────────────────────────────────────────────
-
 async function appendMatch(userId, match) {
   if (!userId || !match) return false;
 
@@ -745,7 +652,6 @@ async function getMatchHistory(userId) {
 // ────────────────────────────────────────────────────────────
 // Leaderboard
 // ────────────────────────────────────────────────────────────
-
 async function listStatsWithUsers() {
   const { data, error } = await supabase
     .from('player_stats')
@@ -771,25 +677,315 @@ async function listStatsWithUsers() {
   });
 }
 
+// ════════════════════════════════════════════════════════════
+// AVATARS (Chat 9b)
+// ════════════════════════════════════════════════════════════
+
+const DEFAULT_PERSONALITY = {
+  aggression: 0.5,
+  memory: 0.5,
+  randomness: 0.5,
+  defense: 0.5,
+};
+
+// Map a DB row to the client-facing shape. Field names match the
+// client Avatar interface exactly (camelCase for multi-word fields).
+function rowToAvatar(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.userId,
+    name: row.name,
+    emoji: row.emoji,
+    personality: row.personality || { ...DEFAULT_PERSONALITY },
+    rating: typeof row.rating === 'number' ? row.rating : 1000,
+    level: typeof row.level === 'number' ? row.level : 1,
+    xp: typeof row.xp === 'number' ? row.xp : 0,
+    wins: typeof row.wins === 'number' ? row.wins : 0,
+    losses: typeof row.losses === 'number' ? row.losses : 0,
+    ties: typeof row.ties === 'number' ? row.ties : 0,
+    winStreak: typeof row.win_streak === 'number' ? row.win_streak : 0,
+    bestStreak: typeof row.best_streak === 'number' ? row.best_streak : 0,
+    titles: Array.isArray(row.titles) ? row.titles : [],
+    defeatedMasters: Array.isArray(row.defeated_masters)
+      ? row.defeated_masters
+      : [],
+    isSelected: !!row.is_selected,
+    imageUrl: row.image_url || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function listAvatars(userId) {
+  if (!userId) return [];
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .select('*')
+    .eq('userId', userId)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('[DB] listAvatars error:', error.message);
+    return [];
+  }
+
+  return (data || []).map(rowToAvatar).filter(Boolean);
+}
+
+async function getSelectedAvatar(userId) {
+  if (!userId) return null;
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .select('*')
+    .eq('userId', userId)
+    .eq('is_selected', true)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getSelectedAvatar error:', error.message);
+    return null;
+  }
+  return data ? rowToAvatar(data) : null;
+}
+
+async function createAvatar(userId, avatar) {
+  if (!userId || !avatar || !avatar.id) return null;
+
+  const { count, error: countErr } = await supabase
+    .from('avatars')
+    .select('id', { count: 'exact', head: true })
+    .eq('userId', userId);
+
+  if (countErr) {
+    console.error('[DB] createAvatar count error:', countErr.message);
+  }
+
+  const isFirst = (count || 0) === 0;
+
+  const row = {
+    id: avatar.id,
+    userId,
+    name: avatar.name || 'Champion',
+    emoji: avatar.emoji || '🤖',
+    personality: avatar.personality || { ...DEFAULT_PERSONALITY },
+    rating: typeof avatar.rating === 'number' ? avatar.rating : 1000,
+    level: typeof avatar.level === 'number' ? avatar.level : 1,
+    xp: typeof avatar.xp === 'number' ? avatar.xp : 0,
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    win_streak: 0,
+    best_streak: 0,
+    titles: Array.isArray(avatar.titles) ? avatar.titles : [],
+    defeated_masters: Array.isArray(avatar.defeatedMasters)
+      ? avatar.defeatedMasters
+      : [],
+    is_selected: isFirst,
+    image_url: avatar.imageUrl || null,
+  };
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .insert(row)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[DB] createAvatar error:', error.message);
+    return null;
+  }
+
+  return rowToAvatar(data);
+}
+
+// Update an avatar's editable fields. Stats (wins/losses/ties) are
+// only mutated by recordAvatarResult. Everything else is editable here.
+async function updateAvatar(userId, avatarId, patch) {
+  if (!userId || !avatarId) return null;
+
+  const update = {};
+  if (patch.name !== undefined) update.name = patch.name;
+  if (patch.emoji !== undefined) update.emoji = patch.emoji;
+  if (patch.personality !== undefined) update.personality = patch.personality;
+  if (patch.rating !== undefined) update.rating = patch.rating;
+  if (patch.level !== undefined) update.level = patch.level;
+  if (patch.xp !== undefined) update.xp = patch.xp;
+  if (patch.titles !== undefined) update.titles = patch.titles;
+  if (patch.winStreak !== undefined) update.win_streak = patch.winStreak;
+  if (patch.bestStreak !== undefined) update.best_streak = patch.bestStreak;
+  if (patch.defeatedMasters !== undefined) {
+    update.defeated_masters = patch.defeatedMasters;
+  }
+  if (patch.imageUrl !== undefined) update.image_url = patch.imageUrl;
+
+  if (Object.keys(update).length === 0) {
+    const { data } = await supabase
+      .from('avatars')
+      .select('*')
+      .eq('id', avatarId)
+      .eq('userId', userId)
+      .maybeSingle();
+    return data ? rowToAvatar(data) : null;
+  }
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .update(update)
+    .eq('id', avatarId)
+    .eq('userId', userId)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] updateAvatar error:', error.message);
+    return null;
+  }
+  return data ? rowToAvatar(data) : null;
+}
+
+async function deleteAvatar(userId, avatarId) {
+  if (!userId || !avatarId) return { deleted: false, newSelectedId: null };
+
+  const { data: target, error: selErr } = await supabase
+    .from('avatars')
+    .select('id, is_selected')
+    .eq('id', avatarId)
+    .eq('userId', userId)
+    .maybeSingle();
+
+  if (selErr) {
+    console.error('[DB] deleteAvatar select error:', selErr.message);
+    return { deleted: false, newSelectedId: null };
+  }
+  if (!target) {
+    return { deleted: false, newSelectedId: null };
+  }
+
+  const wasSelected = !!target.is_selected;
+
+  const { error: delErr } = await supabase
+    .from('avatars')
+    .delete()
+    .eq('id', avatarId)
+    .eq('userId', userId);
+
+  if (delErr) {
+    console.error('[DB] deleteAvatar delete error:', delErr.message);
+    return { deleted: false, newSelectedId: null };
+  }
+
+  let newSelectedId = null;
+  if (wasSelected) {
+    const { data: next } = await supabase
+      .from('avatars')
+      .select('id')
+      .eq('userId', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (next?.id) {
+      await supabase
+        .from('avatars')
+        .update({ is_selected: true })
+        .eq('id', next.id)
+        .eq('userId', userId);
+      newSelectedId = next.id;
+    }
+  }
+
+  return { deleted: true, newSelectedId };
+}
+
+async function selectAvatar(userId, avatarId) {
+  if (!userId || !avatarId) return null;
+
+  const { error: unsetErr } = await supabase
+    .from('avatars')
+    .update({ is_selected: false })
+    .eq('userId', userId);
+
+  if (unsetErr) {
+    console.error('[DB] selectAvatar unset error:', unsetErr.message);
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .update({ is_selected: true })
+    .eq('id', avatarId)
+    .eq('userId', userId)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] selectAvatar set error:', error.message);
+    return null;
+  }
+  return data ? rowToAvatar(data) : null;
+}
+
+// Apply a match result to an avatar. Win → increment wins, win_streak
+// +1, update best_streak if the new win_streak exceeds it. Loss →
+// increment losses, reset win_streak to 0. Ties are ignored (not
+// called for ties — the match path skips avatar mutation on ties).
+async function recordAvatarResult(userId, avatarId, won) {
+  if (!userId || !avatarId) return false;
+
+  const { data: current, error: readErr } = await supabase
+    .from('avatars')
+    .select('wins, losses, ties, win_streak, best_streak')
+    .eq('id', avatarId)
+    .eq('userId', userId)
+    .maybeSingle();
+
+  if (readErr || !current) {
+    console.error('[DB] recordAvatarResult read error:', readErr?.message);
+    return false;
+  }
+
+  const wins = (current.wins || 0) + (won ? 1 : 0);
+  const losses = (current.losses || 0) + (won ? 0 : 1);
+  const newWinStreak = won ? (current.win_streak || 0) + 1 : 0;
+  const newBestStreak = Math.max(current.best_streak || 0, newWinStreak);
+
+  const { error: writeErr } = await supabase
+    .from('avatars')
+    .update({
+      wins,
+      losses,
+      win_streak: newWinStreak,
+      best_streak: newBestStreak,
+    })
+    .eq('id', avatarId)
+    .eq('userId', userId);
+
+  if (writeErr) {
+    console.error('[DB] recordAvatarResult write error:', writeErr.message);
+    return false;
+  }
+  return true;
+}
+
 // ────────────────────────────────────────────────────────────
-// ACHIEVEMENTS (Chat 7 — roadmap item #4)
+// ACHIEVEMENTS
 // ────────────────────────────────────────────────────────────
 
 const ACHIEVEMENT_CATALOG = [
-  // ── Progression (5) ──
   { id: 'first_win',         name: 'First Win',         icon: '🥇', category: 'progression', rule: 'wins >= 1',            description: 'Win your first match.' },
   { id: 'ten_wins',          name: 'Getting Started',   icon: '🎯', category: 'progression', rule: 'wins >= 10',           description: 'Win 10 matches.' },
   { id: 'fifty_wins',        name: 'Half Century',      icon: '🏅', category: 'progression', rule: 'wins >= 50',           description: 'Win 50 matches.' },
   { id: 'hundred_wins',      name: 'Century Club',      icon: '💯', category: 'progression', rule: 'wins >= 100',          description: 'Win 100 matches.' },
   { id: 'five_hundred_wins', name: 'Legend',            icon: '👑', category: 'progression', rule: 'wins >= 500',          description: 'Win 500 matches.' },
 
-  // ── Streaks (4) ──
   { id: 'streak_5',          name: 'On Fire',           icon: '🔥', category: 'streaks',     rule: 'bestStreak >= 5',      description: 'Win 5 matches in a row.' },
   { id: 'streak_10',         name: 'Unstoppable',       icon: '⚡', category: 'streaks',     rule: 'bestStreak >= 10',     description: 'Win 10 matches in a row.' },
   { id: 'streak_20',         name: 'Immortal',          icon: '♾️', category: 'streaks',     rule: 'bestStreak >= 20',     description: 'Win 20 matches in a row.' },
   { id: 'perfect_week',      name: 'Perfect Week',      icon: '📅', category: 'streaks',     rule: 'won a match 7 days in a row', description: 'Win at least one match every day for 7 days.' },
 
-  // ── Mode Mastery (6) ──
   { id: 'human_champ',       name: "People's Champion", icon: '👥', category: 'mode',        rule: 'humanWins >= 10',      description: 'Win 10 Human vs Human matches.' },
   { id: 'avatar_champ',      name: 'Arena Champion',    icon: '🎭', category: 'mode',        rule: 'avatarWins >= 10',     description: 'Win 10 Avatar Arena matches.' },
   { id: 'dojo_master',       name: 'Dojo Master',       icon: '🥋', category: 'mode',        rule: 'dojoWins >= 10',       description: 'Win 10 AI Dojo matches.' },
@@ -797,18 +993,15 @@ const ACHIEVEMENT_CATALOG = [
   { id: 'mode_specialist',   name: 'Mode Specialist',   icon: '🎪', category: 'mode',        rule: '100 wins in any single mode', description: 'Win 100 matches in a single mode.' },
   { id: 'jack_of_all_trades',name: 'Jack of All Trades',icon: '🃏', category: 'mode',        rule: '50 wins in each mode', description: 'Win 50 matches in every mode.' },
 
-  // ── Dojo Specials (4) ──
   { id: 'grandmaster_slayer',name: 'Grandmaster Slayer',icon: '🐉', category: 'dojo',        rule: 'beat Grandmaster at least once', description: 'Defeat the Grandmaster.' },
   { id: 'dojo_sweeper',      name: 'Dojo Sweeper',      icon: '🧹', category: 'dojo',        rule: 'beat all 4 masters (Rookie, Tactician, Hunter, Grandmaster)', description: 'Defeat every dojo master at least once.' },
   { id: 'rookie_killer',     name: 'Rookie Killer',     icon: '🐣', category: 'dojo',        rule: 'beat Rookie 10 times', description: 'Defeat the Rookie 10 times.' },
   { id: 'hunter_survivor',   name: 'Hunter Survivor',   icon: '🏹', category: 'dojo',        rule: 'beat Hunter 5 times',  description: 'Defeat the Hunter 5 times.' },
 
-  // ── Volume (3) ──
   { id: 'veteran',           name: 'Veteran',           icon: '🎖️', category: 'volume',      rule: 'total matches >= 100', description: 'Play 100 matches.' },
   { id: 'grinder',           name: 'Grinder',           icon: '⚙️', category: 'volume',      rule: 'total matches >= 500', description: 'Play 500 matches.' },
   { id: 'addict',            name: 'Addict',            icon: '🧠', category: 'volume',      rule: 'total matches >= 1000',description: 'Play 1000 matches.' },
 
-  // ── Social (3) ──
   { id: 'social_5',          name: 'Getting Social',    icon: '🤝', category: 'social',      rule: 'played vs 5 unique opponents', description: 'Play against 5 different opponents.' },
   { id: 'social_25',         name: 'Well-Connected',    icon: '🌐', category: 'social',      rule: 'played vs 25 unique opponents', description: 'Play against 25 different opponents.' },
   { id: 'rematch_king',      name: 'Rematch King',      icon: '🔁', category: 'social',      rule: 'played 10 rematches',  description: 'Play 10 rematches.' },
@@ -1015,18 +1208,18 @@ module.exports = {
   getUserById,
   isUsernameAvailable,
   updateUsername,
-  updateAvatar,
+  updateUserAvatar,
   ensureUserRow,
 
-  // profiles (Chat 9)
+  // profiles
   getProfile,
   updateProfileUsername,
   setPremium,
 
-  // deletion (Chat 9)
+  // deletion
   deleteUserEverywhere,
 
-  // legacy migration (Chat 9)
+  // legacy migration
   findLegacyUserIdByToken,
   deleteLegacyToken,
   migrateLegacyUser,
@@ -1042,7 +1235,16 @@ module.exports = {
   // leaderboard
   listStatsWithUsers,
 
-  // achievements (Chat 7)
+  // avatars
+  listAvatars,
+  getSelectedAvatar,
+  createAvatar,
+  updateAvatar,
+  deleteAvatar,
+  selectAvatar,
+  recordAvatarResult,
+
+  // achievements
   ACHIEVEMENT_CATALOG,
   ACHIEVEMENT_BY_ID,
   checkAchievements,
