@@ -6,13 +6,15 @@
 // Chat 7: achievements.
 // Chat 9: Supabase Auth migration (Option A-lite).
 // Chat 9b: avatars.
-// Chat 9b (revised):
-//   - rowToAvatar mirrors the client Avatar interface exactly, including
-//     xp, titles, winStreak.
-//   - createAvatar writes xp / titles / win_streak.
-//   - updateAvatar accepts xp, titles, winStreak edits.
-//   - recordAvatarResult updates both win_streak (current) and
-//     best_streak (record) on a win.
+// Chat 9c: ES256 JWT verification (in server.js).
+// Chat 9d:
+//   - createAvatar now generates its own UUID server-side.
+//     Fixes "invalid input syntax for type uuid" caused by the
+//     client sending non-UUID ids from AvatarEngine.
+//   - New createDefaultAvatarForUser(uid, name) — idempotent default
+//     avatar for users with zero avatars.
+//   - New renameDefaultAvatarIfNeeded(uid, newName) — renames a
+//     single "Guest"/"Player" avatar to the user's chosen name.
 //
 // Uses the SERVICE_ROLE key — the server is trusted. Never ship this
 // key to the client.
@@ -20,6 +22,7 @@
 'use strict';
 
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -161,9 +164,6 @@ async function updateUsername(userId, username, avatar) {
   return true;
 }
 
-// User-level avatar (the single emoji profile avatar, not the avatars
-// table). Kept separate from updateAvatar (avatar-level) to avoid a
-// name collision.
 async function updateUserAvatar(userId, avatar) {
   if (!userId || !avatar) return false;
 
@@ -365,8 +365,7 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
   }
 
   const syntheticEmail = `legacy+${oldUserId}@rps-arena.local`;
-  const randomPassword =
-    require('crypto').randomBytes(32).toString('hex');
+  const randomPassword = crypto.randomBytes(32).toString('hex');
 
   const { data: created, error: createErr } =
     await supabase.auth.admin.createUser({
@@ -422,7 +421,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
     }
   }
 
-  // avatars also belong to the user — rewrite them too.
   const { error: avatarsErr } = await supabase
     .from('avatars')
     .update({ userId: newUid })
@@ -430,7 +428,6 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 
   if (avatarsErr) {
     console.error('[DB] migrateLegacyUser avatars rewrite error:', avatarsErr.message);
-    // Non-fatal — legacy users likely have no server avatars anyway.
   }
 
   const { error: delOldErr } = await supabase
@@ -678,7 +675,7 @@ async function listStatsWithUsers() {
 }
 
 // ════════════════════════════════════════════════════════════
-// AVATARS (Chat 9b)
+// AVATARS
 // ════════════════════════════════════════════════════════════
 
 const DEFAULT_PERSONALITY = {
@@ -688,8 +685,6 @@ const DEFAULT_PERSONALITY = {
   defense: 0.5,
 };
 
-// Map a DB row to the client-facing shape. Field names match the
-// client Avatar interface exactly (camelCase for multi-word fields).
 function rowToAvatar(row) {
   if (!row) return null;
   return {
@@ -751,8 +746,16 @@ async function getSelectedAvatar(userId) {
   return data ? rowToAvatar(data) : null;
 }
 
+// Create an avatar.
+//
+// CHAT 9d FIX: the server generates its own UUID for `id`. The client's
+// proposed id is ignored — AvatarEngine produces non-UUID strings that
+// Postgres rejects.
+//
+// Auto-selects if this is the user's first avatar. Returns the created
+// avatar, or null on failure.
 async function createAvatar(userId, avatar) {
-  if (!userId || !avatar || !avatar.id) return null;
+  if (!userId) return null;
 
   const { count, error: countErr } = await supabase
     .from('avatars')
@@ -766,25 +769,25 @@ async function createAvatar(userId, avatar) {
   const isFirst = (count || 0) === 0;
 
   const row = {
-    id: avatar.id,
+    id: crypto.randomUUID(),   // ← FIX: server-generated UUID
     userId,
-    name: avatar.name || 'Champion',
-    emoji: avatar.emoji || '🤖',
-    personality: avatar.personality || { ...DEFAULT_PERSONALITY },
-    rating: typeof avatar.rating === 'number' ? avatar.rating : 1000,
-    level: typeof avatar.level === 'number' ? avatar.level : 1,
-    xp: typeof avatar.xp === 'number' ? avatar.xp : 0,
+    name: avatar?.name || 'Champion',
+    emoji: avatar?.emoji || '🤖',
+    personality: avatar?.personality || { ...DEFAULT_PERSONALITY },
+    rating: typeof avatar?.rating === 'number' ? avatar.rating : 1000,
+    level: typeof avatar?.level === 'number' ? avatar.level : 1,
+    xp: typeof avatar?.xp === 'number' ? avatar.xp : 0,
     wins: 0,
     losses: 0,
     ties: 0,
     win_streak: 0,
     best_streak: 0,
-    titles: Array.isArray(avatar.titles) ? avatar.titles : [],
-    defeated_masters: Array.isArray(avatar.defeatedMasters)
+    titles: Array.isArray(avatar?.titles) ? avatar.titles : [],
+    defeated_masters: Array.isArray(avatar?.defeatedMasters)
       ? avatar.defeatedMasters
       : [],
     is_selected: isFirst,
-    image_url: avatar.imageUrl || null,
+    image_url: avatar?.imageUrl || null,
   };
 
   const { data, error } = await supabase
@@ -801,8 +804,104 @@ async function createAvatar(userId, avatar) {
   return rowToAvatar(data);
 }
 
-// Update an avatar's editable fields. Stats (wins/losses/ties) are
-// only mutated by recordAvatarResult. Everything else is editable here.
+// Idempotent default-avatar factory.
+// Creates one 🤖 avatar for the given user if they have zero avatars.
+// Returns the created avatar (or null if no-op / failure).
+async function createDefaultAvatarForUser(uid, name) {
+  if (!uid) return null;
+
+  const { count, error: countErr } = await supabase
+    .from('avatars')
+    .select('id', { count: 'exact', head: true })
+    .eq('userId', uid);
+
+  if (countErr) {
+    console.error('[DB] createDefaultAvatarForUser count error:', countErr.message);
+    return null;
+  }
+
+  if ((count || 0) > 0) {
+    // Already has avatars. Nothing to do.
+    return null;
+  }
+
+  const safeName = (name && String(name).trim()) || 'Guest';
+
+  const row = {
+    id: crypto.randomUUID(),
+    userId: uid,
+    name: safeName.slice(0, 20),
+    emoji: '🤖',
+    personality: { ...DEFAULT_PERSONALITY },
+    rating: 1000,
+    level: 1,
+    xp: 0,
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    win_streak: 0,
+    best_streak: 0,
+    titles: [],
+    defeated_masters: [],
+    is_selected: true,
+    image_url: null,
+  };
+
+  const { data, error } = await supabase
+    .from('avatars')
+    .insert(row)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[DB] createDefaultAvatarForUser insert error:', error.message);
+    return null;
+  }
+
+  console.log('[DB] default avatar created for', uid, '→', safeName);
+  return rowToAvatar(data);
+}
+
+// If the user has exactly one avatar whose name is 'Guest' or 'Player',
+// rename it to newName. No-op in every other case.
+// Returns true if a rename happened, false otherwise.
+async function renameDefaultAvatarIfNeeded(uid, newName) {
+  if (!uid || !newName) return false;
+
+  const { data: avatars, error } = await supabase
+    .from('avatars')
+    .select('id, name')
+    .eq('userId', uid);
+
+  if (error) {
+    console.error('[DB] renameDefaultAvatarIfNeeded select error:', error.message);
+    return false;
+  }
+
+  if (!avatars || avatars.length !== 1) return false;
+
+  const only = avatars[0];
+  const currentName = (only.name || '').trim();
+  if (currentName !== 'Guest' && currentName !== 'Player') return false;
+
+  const safeName = String(newName).trim().slice(0, 20);
+  if (!safeName) return false;
+
+  const { error: updErr } = await supabase
+    .from('avatars')
+    .update({ name: safeName })
+    .eq('id', only.id)
+    .eq('userId', uid);
+
+  if (updErr) {
+    console.error('[DB] renameDefaultAvatarIfNeeded update error:', updErr.message);
+    return false;
+  }
+
+  console.log('[DB] renamed default avatar for', uid, '→', safeName);
+  return true;
+}
+
 async function updateAvatar(userId, avatarId, patch) {
   if (!userId || !avatarId) return null;
 
@@ -928,10 +1027,6 @@ async function selectAvatar(userId, avatarId) {
   return data ? rowToAvatar(data) : null;
 }
 
-// Apply a match result to an avatar. Win → increment wins, win_streak
-// +1, update best_streak if the new win_streak exceeds it. Loss →
-// increment losses, reset win_streak to 0. Ties are ignored (not
-// called for ties — the match path skips avatar mutation on ties).
 async function recordAvatarResult(userId, avatarId, won) {
   if (!userId || !avatarId) return false;
 
@@ -1243,6 +1338,10 @@ module.exports = {
   deleteAvatar,
   selectAvatar,
   recordAvatarResult,
+
+  // avatars (Chat 9d)
+  createDefaultAvatarForUser,
+  renameDefaultAvatarIfNeeded,
 
   // achievements
   ACHIEVEMENT_CATALOG,

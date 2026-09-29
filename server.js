@@ -4,14 +4,14 @@
 //
 // Chat 1: tokens. Chat 2: adaptive AI. Chat 4: Supabase.
 // Chat 5: Dojo stats sync. Chat 7: achievements.
-// Chat 9: Supabase Auth migration (JWT middleware, identify,
-//         migrateLegacyToken, deleteUserEverywhere).
-// Chat 9b: avatars (getAvatars/createAvatar/updateAvatar/deleteAvatar/
-//          selectAvatar), profiles-driven identify, snapshot avatars
-//          at match start, dojo log, changeUsername receive log.
+// Chat 9: Supabase Auth migration.
+// Chat 9b: avatars, profiles-driven identify, avatar W/L on match end.
 // Chat 9c: ES256-only JWT verification via Supabase JWKS (jose).
-//          - Removed jsonwebtoken and SUPABASE_JWT_SECRET.
-//          - HS256 and every other alg are rejected.
+// Chat 9d:
+//   - identify auto-creates a default avatar for users with zero.
+//   - identify + changeUsername rename a lone "Guest"/"Player" avatar
+//     to the user's chosen name.
+//   - New checkUsernameAvailability socket event for signup.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -54,8 +54,6 @@ if (!SUPABASE_ANON_KEY) {
 }
 
 // ─── Supabase JWKS (ES256 verification) ───
-// jose caches keys internally and refreshes on demand.
-// The apikey header is required by Supabase's auth gateway.
 const SUPABASE_JWKS_URL = SUPABASE_URL
   ? `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`
   : null;
@@ -64,9 +62,7 @@ let jwks = null;
 if (SUPABASE_JWKS_URL && SUPABASE_ANON_KEY) {
   jwks = createRemoteJWKSet(new URL(SUPABASE_JWKS_URL), {
     headers: { apikey: SUPABASE_ANON_KEY },
-    // Cooldown between refresh attempts when a kid isn't found.
     cooldownDuration: 10_000,
-    // Cache the JWKS in memory between refreshes.
     cacheMaxAge: 10 * 60 * 1000,
   });
   console.log('[JWT] JWKS configured:', SUPABASE_JWKS_URL);
@@ -78,8 +74,8 @@ if (SUPABASE_JWKS_URL && SUPABASE_ANON_KEY) {
 
 // ─── In-memory state ───
 const rooms = new Map();
-const players = new Map();          // socketId → { room, name, username, userId, avatar }
-const onlinePlayers = new Map();    // socketId → { userId, name, username, avatar, status, socketId, connectedAt }
+const players = new Map();
+const onlinePlayers = new Map();
 const activeInvites = new Map();
 const recentOpponents = new Map();
 
@@ -391,7 +387,6 @@ async function recordMatchResult(room) {
   const rounds = room.round;
   const timestamp = Date.now();
 
-  // ── P1 history ──
   await db.appendMatch(p1UserId, {
     mode: room.battleMode,
     opponent: p2Name,
@@ -403,7 +398,6 @@ async function recordMatchResult(room) {
     timestamp,
   });
 
-  // ── P1 stats ──
   const p1Stats = await db.getOrCreateStats(p1UserId);
   if (p1Won) {
     p1Stats.wins++;
@@ -441,7 +435,6 @@ async function recordMatchResult(room) {
     }));
   }
 
-  // ── P2 history ──
   await db.appendMatch(p2UserId, {
     mode: room.battleMode,
     opponent: p1Name,
@@ -453,7 +446,6 @@ async function recordMatchResult(room) {
     timestamp,
   });
 
-  // ── P2 stats ──
   const p2Stats = await db.getOrCreateStats(p2UserId);
   if (p2Won) {
     p2Stats.wins++;
@@ -497,7 +489,6 @@ async function recordMatchResult(room) {
   console.log('[MATCH RECORDED]', p1Name, 'vs', p2Name, '→ winner:',
     room.winner === p1 ? p1Name : p2Name, `(${mode})`);
 
-  // ── Avatar W/L ──
   if (room.avatarIds) {
     const p1AvatarId = room.avatarIds[p1];
     const p2AvatarId = room.avatarIds[p2];
@@ -514,7 +505,6 @@ async function recordMatchResult(room) {
     }
   }
 
-  // ── Achievements ──
   try {
     const p1Unlocked = await db.checkAchievements(p1UserId);
     emitAchievementsToSocket(p1, p1Unlocked);
@@ -762,28 +752,12 @@ function startAvatarAutoPlay(roomCode) {
 // ════════════════════════════════════════════════════════════
 // JWT middleware — ES256-only via Supabase JWKS (jose)
 // ════════════════════════════════════════════════════════════
-//
-// Flow:
-//   1. Read auth.token from the handshake.
-//   2. Decode the JWT header (no verification) to read `alg`.
-//   3. Reject anything that isn't ES256 with a clear reason.
-//   4. Verify ES256 against the cached Supabase JWKS.
-//   5. Extract sub → socket.data.userId.
-//
-// Legacy migration: a socket that presents auth.legacyToken (and no
-// auth.token) is allowed to connect with userId=null so it can run
-// migrateLegacyToken.
-//
-// All other sockets must present a valid ES256 JWT or they're
-// rejected at handshake time.
-
 io.use(async (socket, next) => {
   const auth = socket.handshake.auth || {};
   const token = typeof auth.token === 'string' ? auth.token : null;
   const legacyToken =
     typeof auth.legacyToken === 'string' ? auth.legacyToken : null;
 
-  // Legacy-only socket: allow connect, but userId stays null.
   if (!token && legacyToken) {
     socket.data.userId = null;
     socket.data.legacyOnly = true;
@@ -791,7 +765,6 @@ io.use(async (socket, next) => {
   }
 
   if (!token) {
-    // No auth at all. Allow the connect; handlers guard on userId.
     socket.data.userId = null;
     return next();
   }
@@ -801,7 +774,6 @@ io.use(async (socket, next) => {
     return next(new Error('jwks-not-configured'));
   }
 
-  // 1. Peek at the header to decide the algorithm.
   let header;
   try {
     header = decodeProtectedHeader(token);
@@ -816,7 +788,6 @@ io.use(async (socket, next) => {
     return next(new Error(`unsupported-jwt-alg:${alg || 'none'}`));
   }
 
-  // 2. Verify against the JWKS.
   try {
     const { payload } = await jwtVerify(token, jwks, {
       algorithms: ['ES256'],
@@ -850,6 +821,7 @@ io.on('connection', (socket) => {
 
   // ────────────────────────────────────────────────────────────
   // identify — uses profiles.username / profiles.avatar
+  // Also ensures the user has at least one avatar (Chat 9d).
   // ────────────────────────────────────────────────────────────
   socket.on('identify', async (data) => {
     const uid = socket.data.userId;
@@ -930,12 +902,35 @@ io.on('connection', (socket) => {
     const stats = await db.getOrCreateStats(uid);
     socket.emit('playerStats', { stats });
 
+    // ── Chat 9d: ensure at least one avatar exists. ──
     let avatars = [];
     try {
       avatars = await db.listAvatars(uid);
     } catch (e) {
       console.error('[IDENTIFY] listAvatars failed:', e?.message);
     }
+
+    if (avatars.length === 0) {
+      // Fresh user (or all avatars deleted). Create a default one.
+      // Name: username if we have one, else "Guest".
+      try {
+        await db.createDefaultAvatarForUser(uid, user.username || 'Guest');
+        avatars = await db.listAvatars(uid);
+      } catch (e) {
+        console.error('[IDENTIFY] createDefaultAvatarForUser failed:', e?.message);
+      }
+    } else {
+      // User already had avatars. If they had exactly one named
+      // "Guest"/"Player" and now have a real username, rename it.
+      try {
+        await db.renameDefaultAvatarIfNeeded(uid, user.username);
+      } catch (e) {
+        console.error('[IDENTIFY] renameDefaultAvatarIfNeeded failed:', e?.message);
+      }
+      // Refresh in case rename changed a name.
+      avatars = await db.listAvatars(uid);
+    }
+
     socket.emit('avatars', { avatars });
 
     const payload = socket.data.jwtPayload || {};
@@ -1002,6 +997,58 @@ io.on('connection', (socket) => {
       socket.emit('legacyMigrationResult', {
         success: false,
         message: 'Migration failed',
+      });
+    }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // checkUsernameAvailability (Chat 9d — new)
+  //   Payload: { username }
+  //   Emits:   usernameAvailability { username, available, message? }
+  //
+  // Does NOT require auth. Purely informational for the signup form.
+  // Does NOT reserve the name — only reports current availability.
+  // The real uniqueness enforcement happens in changeUsername / link.
+  // ────────────────────────────────────────────────────────────
+  socket.on('checkUsernameAvailability', async (data) => {
+    const raw = (data?.username || '').trim().slice(0, 15);
+    const normalized = normalizeUsername(raw);
+
+    if (!normalized || normalized.length < 3) {
+      socket.emit('usernameAvailability', {
+        username: raw,
+        available: false,
+        message: 'Username must be at least 3 characters',
+      });
+      return;
+    }
+
+    if (normalized.length > 15) {
+      socket.emit('usernameAvailability', {
+        username: raw,
+        available: false,
+        message: 'Username must be 15 characters or less',
+      });
+      return;
+    }
+
+    // Exclude the caller's own userId so their current name shows
+    // as available (they can "change" to the same name).
+    const exceptUid = socket.data.userId || undefined;
+
+    try {
+      const available = await isUsernameAvailable(normalized, exceptUid);
+      socket.emit('usernameAvailability', {
+        username: raw,
+        available,
+        message: available ? undefined : 'That username is already taken',
+      });
+    } catch (e) {
+      console.error('[USERNAME CHECK] error:', e?.message);
+      socket.emit('usernameAvailability', {
+        username: raw,
+        available: false,
+        message: 'Could not check availability',
       });
     }
   });
@@ -1078,6 +1125,10 @@ io.on('connection', (socket) => {
     db.supabase.auth.admin
       .updateUserById(uid, { user_metadata: { username: normalized } })
       .catch(() => {});
+
+    // Chat 9d: if the user still has their lone default avatar,
+    // rename it to match.
+    db.renameDefaultAvatarIfNeeded(uid, normalized).catch(() => {});
 
     const player = players.get(socket.id);
     if (player) {
