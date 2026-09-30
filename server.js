@@ -12,27 +12,33 @@
 //   - identify + changeUsername rename a lone "Guest"/"Player" avatar
 //     to the user's chosen name.
 //   - New checkUsernameAvailability socket event for signup.
-// Chat 11 — Tournament Mode:
-//   - Two new in-memory maps: tournaments (id → state), tournamentCodes
-//     (code → id). Persistent mirror lives in Supabase
-//     (tournaments + tournament_rounds) via db.js.
-//   - New socket events: createTournament, joinTournament,
-//     leaveTournament, pressActive, startTournament, beginNextRound,
-//     getTournament.
-//   - New broadcasts: tournamentState, tournamentStarted, roundStarted,
-//     activeWindowUpdate, playerActive, playerInactive, hostChanged,
-//     matchAssigned, tournamentScoresUpdate, roundComplete,
-//     tournamentComplete.
-//   - room.winTarget added. Defaults to WIN_TARGET (30). Only
-//     tournament rooms set it differently (STEP 4: 15..30).
-//   - sendMessage now routes to io.to('tournament:' + id) when the
-//     sender is in a tournament. Non-tournament rooms are unchanged.
-//   - handleDisconnect / handleLeave call tournamentEngine hooks after
-//     their existing cleanup. Non-tournament behavior is unchanged.
-//   - makeMove calls tournamentEngine.onMatchProgress(room) after the
-//     existing roundResult emit if room.tournamentId is set.
-//   - AVATAR_ROUND_DELAY, WIN_TARGET, DISCONNECT_TIMEOUT, INVITE_TIMEOUT,
-//     MAX_RECENT_MOVES all preserved.
+// Chat 11 — Tournament Mode.
+// Chat 11 — Tournament Mode bug fix pass:
+//   B1  emitMatchAssigned moved from beginRound into closeActiveWindow.
+//       The match screen only opens AFTER the Active window closes for
+//       surviving players. Previously both clients were navigated to
+//       the match immediately and never saw the Active button.
+//   B2  closeActiveWindow now cancels the room for any match affected
+//       by elimination, emits matchCancelled to the room so both
+//       clients navigate away.
+//   B3  pressActive early-close now checks that every currently-active
+//       player is in the activeSet, not just a size comparison.
+//   B4  checkRoundComplete has an idempotency guard.
+//   B5  onMatchProgress early-returns if the match is already complete.
+//   B6  _handleParticipantGone only fires on real socket disconnect or
+//       an explicit leave, not on every match-screen unmount. The
+//       unmount path no longer emits leaveRoom for tournament rooms.
+//   B9  roundStarted emitted exactly once per round (was emitted twice:
+//       once in beginRound and once in openActiveWindow).
+//   B11 Rooms are notified on every walkover path (disconnect + active
+//       timeout + leave).
+//   B16 BYE players are auto-added to activeSet so they survive the
+//       Active check.
+//   B21 winTarget is server-authoritative. The client no longer sends
+//       it in createRoom, and the server no longer honors a client
+//       override. Both clients read winTarget from roomState.
+//   B22 publicState includes a usernames map. Populated on identify,
+//       on join, and on start. Every client screen reads from it.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -119,8 +125,6 @@ const ACTIVE_TICK_MS = 1000;              // 1s countdown updates
 const TOURNAMENT_CODE_LEN = 6;            // STEP 6
 const TOURNAMENT_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
-// 32-color palette for bracket square borders + backgrounds.
-// STEP 5: one unique color per player, assigned randomly at start.
 const TOURNAMENT_COLORS = [
   '#ef4444', '#f97316', '#f59e0b', '#eab308',
   '#84cc16', '#22c55e', '#10b981', '#14b8a6',
@@ -144,8 +148,6 @@ function generateRoomCode() {
 }
 
 function generateTournamentCode() {
-  // 6 chars, same alphabet as room codes. Retries on collision against
-  // the in-memory code index (which mirrors the DB unique constraint).
   for (let attempt = 0; attempt < 20; attempt++) {
     let code = '';
     const bytes = crypto.randomBytes(TOURNAMENT_CODE_LEN);
@@ -154,8 +156,6 @@ function generateTournamentCode() {
     }
     if (!tournamentCodes.has(code)) return code;
   }
-  // Extremely unlikely; fall back to a longer unique string truncated
-  // — should never happen in practice.
   return ('T' + Date.now().toString(36)).slice(0, TOURNAMENT_CODE_LEN).toUpperCase();
 }
 
@@ -787,9 +787,6 @@ function startAvatarAutoPlay(roomCode) {
       recordMatchResult(r).catch((e) =>
         console.error('[MATCH RECORD ERROR]', e?.message)
       );
-      if (r.tournamentId) {
-        tournamentEngine.onMatchProgress(r);
-      }
     }
 
     io.to(roomCode).emit('roundResult', {
@@ -805,7 +802,9 @@ function startAvatarAutoPlay(roomCode) {
     });
 
     if (r.tournamentId) {
-      tournamentEngine.onMatchProgress(r);
+      tournamentEngine.onMatchProgress(r).catch((e) =>
+        console.error('[TOURNAMENT] onMatchProgress (auto) error:', e?.message)
+      );
     }
 
     if (!r.matchOver) {
@@ -820,23 +819,21 @@ function startAvatarAutoPlay(roomCode) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// TOURNAMENT ENGINE (Chat 11)
+// TOURNAMENT ENGINE (Chat 11) — bug-fix pass
 // ════════════════════════════════════════════════════════════════
 //
-// In-memory mirror of the tournaments + tournament_rounds tables.
-// All identity is by userId (Supabase UID as text) — never by
-// username, never by socketId. Matches the rest of the app's
-// persistent schema and sidesteps Known Issues #2/#3.
-//
-// Lifecycle:
-//   lobby   → createTournament. Players join by code. Host can start.
-//   live    → bracket created. Rounds run with a 90s Active window.
-//   finished→ champion determined, rewards applied, tournamentComplete.
-//
-// Room integration:
-//   Each bracket match creates a normal room via the existing
-//   createRoom / joinRoom flow with room.tournamentId set. Match end
-//   calls tournamentEngine.onMatchProgress(room) to advance the bracket.
+// Round lifecycle (post-fix):
+//   1. beginRound: create rooms, emit roundStarted once, open Active.
+//      Do NOT emit matchAssigned. Clients stay on the bracket and
+//      see the Active button.
+//   2. Players press Active. When everyone alive has pressed, the
+//      window closes early. Otherwise the 90s timer closes it.
+//   3. closeActiveWindow: eliminate non-Active players, cancel their
+//      rooms with matchCancelled, mark walkovers, then emit
+//      matchAssigned to survivors' matches.
+//   4. Survivors play. matchAssigned -> TournamentMatchScreen.
+//   5. Match resolves -> onMatchProgress -> checkRoundComplete.
+//   6. Round complete -> next round (auto or host-triggered).
 
 const tournamentEngine = {
   // ────────────────────────────────────────────────────────
@@ -879,6 +876,10 @@ const tournamentEngine = {
 
     if (!row) return { error: 'Could not create tournament' };
 
+    // Pre-populate the host's username.
+    const usernames = {};
+    usernames[userId] = this._lookupUsernameSync(userId) || 'Player';
+
     const state = {
       id: row.id,
       code: row.code,
@@ -892,15 +893,14 @@ const tournamentEngine = {
       status: 'lobby',
       currentRound: 0,
       colorMap: {},
-      players: [userId],           // userIds in join order
+      players: [userId],
       winnerId: null,
-      // Runtime-only
+      usernames,                    // B22
       createdAt: Date.now(),
-      activeDeadline: null,        // ms epoch when Active window closes
-      activeTickHandle: null,      // setInterval for activeWindowUpdate
-      activeSet: new Set(),        // userIds who pressed Active this round
-      rounds: [],                  // [{ roundNumber, matches: [], bye, status }]
-      socketIdsByUserId: new Map(),// userId → Set<socketId>
+      activeDeadline: null,
+      activeTickHandle: null,
+      activeSet: new Set(),
+      rounds: [],
     };
 
     tournaments.set(state.id, state);
@@ -911,17 +911,14 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // getState / hydrate
+  // get / hydrate
   // ────────────────────────────────────────────────────────
   async get(tournamentId) {
     if (!tournamentId) return null;
     if (tournaments.has(tournamentId)) return tournaments.get(tournamentId);
-    // Hydrate from DB if it's not live in memory (e.g. after a restart
-    // and the tournament is still in lobby). Live tournaments are
-    // in-memory only — logged as known limitation.
     const row = await db.getTournamentById(tournamentId);
     if (!row) return null;
-    if (row.status !== 'lobby') return null;  // do not resurrect live tournaments
+    if (row.status !== 'lobby') return null;
     const state = {
       id: row.id,
       code: row.code,
@@ -937,13 +934,18 @@ const tournamentEngine = {
       colorMap: {},
       players: Array.isArray(row.players) ? [...row.players] : [],
       winnerId: null,
+      usernames: {},
       createdAt: Date.now(),
       activeDeadline: null,
       activeTickHandle: null,
       activeSet: new Set(),
       rounds: [],
-      socketIdsByUserId: new Map(),
     };
+    // Populate usernames from the DB for each known player.
+    for (const uid of state.players) {
+      const u = await db.getUserById(uid).catch(() => null);
+      if (u?.username) state.usernames[uid] = u.username;
+    }
     tournaments.set(state.id, state);
     tournamentCodes.set(state.code, state.id);
     return state;
@@ -977,24 +979,26 @@ const tournamentEngine = {
       return { error: 'Tournament is full' };
     }
     state.players.push(userId);
+    // B22: capture username for the joined user immediately.
+    const uname = this._lookupUsernameSync(userId);
+    if (uname) state.usernames[userId] = uname;
     await db.updateTournament(state.id, { players: state.players });
     return { tournament: this.publicState(state) };
   },
 
   // ────────────────────────────────────────────────────────
-  // leave (before start)
+  // leave (lobby only)
   // ────────────────────────────────────────────────────────
   async leave(userId, tournamentId) {
     if (!userId || !tournamentId) return;
     const state = await this.get(tournamentId);
     if (!state) return;
-    if (state.status !== 'lobby') return;    // cannot leave after start; disconnect path handles it
+    if (state.status !== 'lobby') return;
 
     if (!state.players.includes(userId)) return;
     state.players = state.players.filter((p) => p !== userId);
     await db.updateTournament(state.id, { players: state.players });
 
-    // Host leaving in lobby → promote a random remaining player.
     if (state.hostId === userId && state.players.length > 0) {
       const nextHost = state.players[Math.floor(Math.random() * state.players.length)];
       state.hostId = nextHost;
@@ -1021,8 +1025,19 @@ const tournamentEngine = {
     if (state.players.length < 2) return { error: 'Need at least 2 players' };
     if (state.players.length > state.maxPlayers) return { error: 'Too many players' };
 
-    // Assign unique colors (STEP 5: random, no duplicates).
     state.colorMap = this.assignColors(state.players);
+
+    // B22: refresh every player's username before the tournament goes live.
+    for (const uid of state.players) {
+      if (!state.usernames[uid]) {
+        const uname = this._lookupUsernameSync(uid);
+        if (uname) state.usernames[uid] = uname;
+        else {
+          const u = await db.getUserById(uid).catch(() => null);
+          if (u?.username) state.usernames[uid] = u.username;
+        }
+      }
+    }
 
     state.status = 'live';
     state.currentRound = 0;
@@ -1036,14 +1051,12 @@ const tournamentEngine = {
       colorMap: state.colorMap,
     });
 
-    // Round 1 immediately.
     await this.beginRound(state);
-
     return { ok: true };
   },
 
   // ────────────────────────────────────────────────────────
-  // beginNextRound (host only, when !autoAdvance)
+  // beginNextRound (host only, !autoAdvance)
   // ────────────────────────────────────────────────────────
   async beginNextRound(userId, tournamentId) {
     if (!userId || !tournamentId) return { error: 'Not authenticated' };
@@ -1053,7 +1066,6 @@ const tournamentEngine = {
     if (state.status !== 'live') return { error: 'Tournament not live' };
     if (state.autoAdvance) return { error: 'This tournament auto-advances' };
 
-    // Only the last round must be complete.
     const last = state.rounds[state.rounds.length - 1];
     if (last && last.status !== 'complete') {
       return { error: 'Previous round is still in progress' };
@@ -1067,17 +1079,19 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // beginRound — creates pairings, room assignments, Active window.
+  // beginRound
+  //
+  // FIXES:
+  //   B1  no emitMatchAssigned here — moved to closeActiveWindow.
+  //   B9  roundStarted emitted exactly once (in openActiveWindow).
+  //   B16 BYE players auto-added to activeSet in openActiveWindow.
   // ────────────────────────────────────────────────────────
   async beginRound(state) {
     if (!state) return;
 
-    // Determine active (still-in) players.
     const activePlayers = [...state.players];
 
-    // Champion determination: 0 or 1 player remaining.
     if (activePlayers.length === 0) {
-      // Should never happen — guard.
       console.error('[TOURNAMENT]', state.id, 'beginRound with 0 players');
       return;
     }
@@ -1090,7 +1104,6 @@ const tournamentEngine = {
     state.currentRound = roundNumber;
     state.activeSet = new Set();
 
-    // Random re-pairing (STEP 5).
     const shuffled = this.shuffle([...activePlayers]);
     const matches = [];
     let bye = null;
@@ -1111,7 +1124,6 @@ const tournamentEngine = {
           scores: { p1: 0, p2: 0, round: 0 },
         });
       } else {
-        // Odd player → BYE, auto-advance.
         bye = shuffled[i];
       }
     }
@@ -1123,6 +1135,7 @@ const tournamentEngine = {
       status: 'pending',
       startedAt: Date.now(),
       completedAt: null,
+      _completing: false,        // B4 idempotency flag
     };
     state.rounds.push(round);
 
@@ -1143,46 +1156,31 @@ const tournamentEngine = {
       status: 'pending',
     });
 
-    // Create the room objects now so the clients can join them.
+    // Pre-create rooms so clients can join them later.
     for (const m of matches) {
       this.createTournamentRoom(state, m);
     }
 
-    // Broadcast roundStarted — every participant learns their own match.
+    // Broadcast state so clients see the round shape (colour-coded, etc.)
     this.broadcastState(state);
-    io.to('tournament:' + state.id).emit('roundStarted', {
-      roundNumber,
-      bye,
-      matches: matches.map((m) => ({
-        matchId: m.matchId,
-        p1: m.p1,
-        p2: m.p2,
-        roomCode: m.roomCode,
-        status: m.status,
-      })),
-    });
 
-    // Broadcast matchAssigned to each participant individually.
-    for (const m of matches) {
-      this.emitMatchAssigned(state, m);
-    }
-
-    // Open the Active window.
+    // Open the Active window (this emits roundStarted once).
     this.openActiveWindow(state, round);
+
+    console.log(
+      '[TOURNAMENT]', state.id, 'round', roundNumber, 'started —',
+      matches.length, 'matches,', bye ? `BYE for ${bye}` : 'no BYE'
+    );
   },
 
   // ────────────────────────────────────────────────────────
-  // createTournamentRoom — a real room with room.tournamentId set.
+  // createTournamentRoom
   // ────────────────────────────────────────────────────────
   createTournamentRoom(state, match) {
     const roomCode = match.roomCode;
     if (!roomCode) return;
-    if (rooms.has(roomCode)) return; // already exists (rare race)
+    if (rooms.has(roomCode)) return;
 
-    // Find the socket for each player. If both are online, we still
-    // wait for them to emit joinRoom / createRoom — the rooms map
-    // here is the persisted object, and players will join it via
-    // the normal flow. We pre-create it so the roomCode is stable.
     const room = {
       code: roomCode,
       players: [],
@@ -1209,7 +1207,7 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // openActiveWindow — 90s, ticks every second.
+  // openActiveWindow
   // ────────────────────────────────────────────────────────
   openActiveWindow(state, round) {
     if (state.activeTickHandle) {
@@ -1224,6 +1222,16 @@ const tournamentEngine = {
       startedAt: round.startedAt,
     }).catch(() => {});
 
+    // B16: BYE player is auto-considered Active for this round.
+    if (round.bye) {
+      state.activeSet.add(round.bye);
+      io.to('tournament:' + state.id).emit('playerActive', {
+        userId: round.bye,
+        color: state.colorMap[round.bye] || null,
+      });
+    }
+
+    // Emit roundStarted ONCE (B9).
     io.to('tournament:' + state.id).emit('roundStarted', {
       roundNumber: round.roundNumber,
       bye: round.bye,
@@ -1241,22 +1249,36 @@ const tournamentEngine = {
       const secondsLeft = Math.max(0, Math.ceil((state.activeDeadline - Date.now()) / 1000));
       io.to('tournament:' + state.id).emit('activeWindowUpdate', { secondsLeft });
       if (secondsLeft <= 0) {
-        this.closeActiveWindow(state, round);
+        this.closeActiveWindow(state, round).catch((e) =>
+          console.error('[TOURNAMENT] closeActiveWindow error:', e?.message)
+        );
       }
     };
 
-    // Emit an initial value immediately.
     tick();
     state.activeTickHandle = setInterval(tick, ACTIVE_TICK_MS);
   },
 
+  // ────────────────────────────────────────────────────────
+  // closeActiveWindow
+  //
+  // FIXES:
+  //   B2  cancel rooms for eliminated players, emit matchCancelled.
+  //   B11 walkover notification to affected rooms.
+  //   B1  emit matchAssigned only for survivors.
+  // ────────────────────────────────────────────────────────
   async closeActiveWindow(state, round) {
+    if (!round) return;
+    if (round._closing) return;
+    round._closing = true;
+
     if (state.activeTickHandle) {
       clearInterval(state.activeTickHandle);
       state.activeTickHandle = null;
     }
+    state.activeDeadline = null;
 
-    // Everyone who has not pressed Active is eliminated.
+    // Who didn't press Active?
     const eliminated = [];
     for (const userId of state.players) {
       if (!state.activeSet.has(userId)) {
@@ -1269,43 +1291,53 @@ const tournamentEngine = {
         userId,
         reason: 'timeout',
       });
+      console.log('[TOURNAMENT]', state.id, 'eliminated', userId, '(did not press Active)');
     }
 
-    // Remove eliminated players from active pool.
     for (const userId of eliminated) {
       state.players = state.players.filter((p) => p !== userId);
     }
 
-    // Also remove BYE player? No — BYE auto-advances.
-    // But if BYE was eliminated for not pressing Active, they are gone.
     if (round.bye && !state.players.includes(round.bye)) {
       round.bye = null;
     }
 
-    // Broadcast updated state.
-    this.broadcastState(state);
-
-    // Re-evaluate champion.
-    if (state.players.length <= 1) {
-      await this.finishTournament(state, state.players[0] || null);
-      return;
-    }
-
-    // Re-check matches: any match whose players were eliminated is a
-    // walkover for the survivor.
+    // Mark matches: walkovers for eliminated players, cancelling the
+    // underlying room if it exists.
     for (const m of round.matches) {
+      if (m.status === 'complete') continue;
       const p1Alive = state.players.includes(m.p1);
       const p2Alive = state.players.includes(m.p2);
+      if (p1Alive && p2Alive) continue;
+
       if (!p1Alive && !p2Alive) {
         m.status = 'complete';
         m.winner = null;
       } else if (!p1Alive) {
         m.status = 'complete';
         m.winner = m.p2;
-      } else if (!p2Alive) {
+      } else {
         m.status = 'complete';
         m.winner = m.p1;
       }
+
+      // Cancel the room so clients navigate away (B2, B11).
+      this._cancelTournamentRoom(m, m.winner, 'active-timeout');
+    }
+
+    this.broadcastState(state);
+
+    if (state.players.length <= 1) {
+      await this.finishTournament(state, state.players[0] || null);
+      return;
+    }
+
+    // B1: emit matchAssigned to survivors' matches only. Matches that
+    // were already completed as walkovers never had their players
+    // navigated to a match screen — that's correct, they advance.
+    for (const m of round.matches) {
+      if (m.status !== 'pending') continue;
+      this.emitMatchAssigned(state, m);
     }
 
     this.broadcastScores(state, round);
@@ -1314,6 +1346,9 @@ const tournamentEngine = {
 
   // ────────────────────────────────────────────────────────
   // pressActive
+  //
+  // FIXES:
+  //   B3  early-close checks every currently-in player.
   // ────────────────────────────────────────────────────────
   async pressActive(userId, tournamentId) {
     if (!userId || !tournamentId) return { error: 'Not authenticated' };
@@ -1332,11 +1367,9 @@ const tournamentEngine = {
     io.to('tournament:' + state.id).emit('playerActive', { userId, color });
     this.broadcastState(state);
 
-    // If everyone remaining has pressed Active, we don't need to wait
-    // for the timer to close the window — the matches can proceed.
-    // The Active window still runs to completion to give visual feedback,
-    // but if all remaining players are already Active we can close early.
-    if (state.activeSet.size >= state.players.length) {
+    // B3: check every CURRENT player is Active, not just a size compare.
+    const allActive = state.players.every((p) => state.activeSet.has(p));
+    if (allActive) {
       await this.closeActiveWindow(state, round);
     }
 
@@ -1344,7 +1377,7 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // onMatchReady — called when a tournament room reaches 2 players.
+  // onMatchReady
   // ────────────────────────────────────────────────────────
   async onMatchReady(room) {
     if (!room || !room.tournamentId || !room.tournamentMatchId) return;
@@ -1361,8 +1394,10 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // onMatchProgress — called from makeMove / startAvatarAutoPlay.
-  // Updates live scores, broadcasts tournamentScoresUpdate.
+  // onMatchProgress
+  //
+  // FIXES:
+  //   B5  early-return if the match is already complete.
   // ────────────────────────────────────────────────────────
   async onMatchProgress(room) {
     if (!room || !room.tournamentId || !room.tournamentMatchId) return;
@@ -1372,6 +1407,7 @@ const tournamentEngine = {
     if (!round) return;
     const m = round.matches.find((x) => x.matchId === room.tournamentMatchId);
     if (!m) return;
+    if (m.status === 'complete') return;    // B5
 
     const [p1Socket, p2Socket] = room.players;
     const p1UserId = onlinePlayers.get(p1Socket)?.userId || players.get(p1Socket)?.userId;
@@ -1406,6 +1442,14 @@ const tournamentEngine = {
 
   // ────────────────────────────────────────────────────────
   // onPlayerDisconnect / onPlayerLeave
+  //
+  // FIXES:
+  //   B6  Distinguish disconnect from intentional leave. Only fires
+  //       for genuine socket loss or an explicit leaveTournament.
+  //       The unmount of TournamentMatchScreen no longer triggers
+  //       a tournament removal.
+  //   B11 Room is cancelled with matchCancelled so both clients can
+  //       navigate away.
   // ────────────────────────────────────────────────────────
   async onPlayerDisconnect(socketId) {
     const uid = onlinePlayers.get(socketId)?.userId ||
@@ -1416,6 +1460,9 @@ const tournamentEngine = {
   },
 
   async onPlayerLeave(socketId) {
+    // B6: this is only called from handleLeave with notify=true,
+    // meaning the user explicitly tapped a leave button. Screen
+    // unmount does NOT route here anymore.
     const uid = onlinePlayers.get(socketId)?.userId ||
                 players.get(socketId)?.userId ||
                 null;
@@ -1424,21 +1471,14 @@ const tournamentEngine = {
   },
 
   async _handleParticipantGone(userId, socketId, reason) {
-    // Find the tournament this userId is in.
     let state = null;
     for (const [, t] of tournaments) {
       if (t.players.includes(userId)) { state = t; break; }
     }
     if (!state) return;
 
-    // In lobby: just remove (leave already does this from the leaveTournament handler).
-    // In live: mark inactive, dim, re-evaluate.
     io.to('tournament:' + state.id).emit('playerInactive', { userId, reason });
 
-    // Do NOT remove from state.players yet — only do so when the round's
-    // active window closes or the round completes, so that mid-match
-    // walkover logic can see the match. We add them to a pending-removal
-    // set that closeActiveWindow / checkRoundComplete consumes.
     state.players = state.players.filter((p) => p !== userId);
 
     if (state.hostId === userId && state.players.length > 0) {
@@ -1449,7 +1489,6 @@ const tournamentEngine = {
       console.log('[TOURNAMENT]', state.id, 'host promoted to', nextHost, `(${reason})`);
     }
 
-    // If in a live round, resolve that match as a walkover.
     const round = state.rounds[state.rounds.length - 1];
     if (round && round.status !== 'complete') {
       for (const m of round.matches) {
@@ -1457,9 +1496,11 @@ const tournamentEngine = {
         if (m.p1 === userId && m.p2 !== userId) {
           m.winner = m.p2;
           m.status = 'complete';
+          this._cancelTournamentRoom(m, m.p2, reason);
         } else if (m.p2 === userId && m.p1 !== userId) {
           m.winner = m.p1;
           m.status = 'complete';
+          this._cancelTournamentRoom(m, m.p1, reason);
         }
       }
       this.broadcastScores(state, round);
@@ -1476,14 +1517,62 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // checkRoundComplete — advances bracket if all matches resolved.
+  // _cancelTournamentRoom
+  //
+  // B2, B11: End a room whose tournament match is no longer live.
+  // Emits matchCancelled so clients on the match screen navigate away.
+  // ────────────────────────────────────────────────────────
+  _cancelTournamentRoom(match, winnerUserId, reason) {
+    if (!match || !match.roomCode) return;
+    const room = rooms.get(match.roomCode);
+    if (!room) return;
+    if (room.matchOver) return;
+
+    room.matchOver = true;
+
+    // Determine the winner socket for the room, if any.
+    let winnerSocket = null;
+    if (winnerUserId) {
+      for (const sid of room.players) {
+        const uid = onlinePlayers.get(sid)?.userId || players.get(sid)?.userId;
+        if (uid === winnerUserId) { winnerSocket = sid; break; }
+      }
+    }
+    room.winner = winnerSocket;
+
+    // Notify the room so both clients leave the match screen.
+    io.to(room.code).emit('matchCancelled', {
+      winnerId: winnerUserId || null,
+      winnerSocketId: winnerSocket || null,
+      reason: reason || 'walkover',
+    });
+
+    // Clean up AI timers if any.
+    if (room.avatarAutoTimer) {
+      clearTimeout(room.avatarAutoTimer);
+      room.avatarAutoTimer = null;
+    }
+    clearAvatarAI(room);
+
+    console.log('[TOURNAMENT] cancelled room', room.code, '| winner:', winnerUserId || '(none)', '| reason:', reason);
+  },
+
+  // ────────────────────────────────────────────────────────
+  // checkRoundComplete
+  //
+  // FIXES:
+  //   B4  idempotency guard.
   // ────────────────────────────────────────────────────────
   async checkRoundComplete(state, round) {
     if (!round || round.status === 'complete') return;
+    if (round._completing) return;
+    round._completing = true;
 
-    // BYE auto-advances; consider it resolved.
     const allResolved = round.matches.every((m) => m.status === 'complete');
-    if (!allResolved) return;
+    if (!allResolved) {
+      round._completing = false;
+      return;
+    }
 
     round.status = 'complete';
     round.completedAt = Date.now();
@@ -1494,8 +1583,6 @@ const tournamentEngine = {
     }
     if (round.bye) winners.push(round.bye);
 
-    // Set state.players to winners (they advance).
-    // Players already removed by disconnect/elimination are gone.
     state.players = Array.from(new Set(winners));
 
     await db.updateTournamentRound(state.id, round.roundNumber, {
@@ -1532,7 +1619,7 @@ const tournamentEngine = {
         this.beginRound(state).catch((e) =>
           console.error('[TOURNAMENT] autoAdvance beginRound failed:', e?.message)
         );
-      }, 4000); // brief pause so clients see the roundComplete banner
+      }, 4000);
     } else {
       state.pendingNextRound = false;
       console.log('[TOURNAMENT]', state.id, 'waiting for host to begin next round');
@@ -1540,7 +1627,7 @@ const tournamentEngine = {
   },
 
   // ────────────────────────────────────────────────────────
-  // finishTournament — champion determined, rewards applied.
+  // finishTournament
   // ────────────────────────────────────────────────────────
   async finishTournament(state, championUserId) {
     if (!state) return;
@@ -1554,7 +1641,6 @@ const tournamentEngine = {
       winnerId: championUserId || null,
     });
 
-    // Determine runner-up and semifinalists from round history.
     const rewards = await this.applyRewards(state, championUserId);
 
     io.to('tournament:' + state.id).emit('tournamentComplete', {
@@ -1564,8 +1650,6 @@ const tournamentEngine = {
 
     console.log('[TOURNAMENT]', state.id, 'finished. champion =', championUserId);
 
-    // Keep the state in memory for a bit so late-joining screens can
-    // read the final state, then evict.
     setTimeout(() => {
       tournaments.delete(state.id);
       tournamentCodes.delete(state.code);
@@ -1578,13 +1662,10 @@ const tournamentEngine = {
   async applyRewards(state, championUserId) {
     const rewards = {};
 
-    // Participant XP
     for (const userId of Object.keys(state.colorMap)) {
       rewards[userId] = { ratingDelta: 0, xpDelta: 50, title: null };
     }
 
-    // Semifinalists: those who made it to the round before the last.
-    // We approximate: everyone in the second-to-last round's matches.
     const rounds = state.rounds || [];
     if (rounds.length >= 2) {
       const semiRound = rounds[rounds.length - 2];
@@ -1600,7 +1681,6 @@ const tournamentEngine = {
       }
     }
 
-    // Runner-up: loser of the final.
     const finalRound = rounds[rounds.length - 1];
     if (finalRound && championUserId) {
       let runnerUpId = null;
@@ -1615,7 +1695,6 @@ const tournamentEngine = {
       }
     }
 
-    // Champion.
     if (championUserId) {
       if (!rewards[championUserId]) rewards[championUserId] = { ratingDelta: 0, xpDelta: 50, title: null };
       rewards[championUserId].ratingDelta += 50;
@@ -1623,7 +1702,6 @@ const tournamentEngine = {
       rewards[championUserId].title = 'Tournament Champion';
     }
 
-    // Apply.
     for (const [userId, r] of Object.entries(rewards)) {
       try {
         const avatars = await db.awardTournamentRewards(userId, {
@@ -1681,6 +1759,7 @@ const tournamentEngine = {
     for (const sid of s2) {
       io.to(sid).emit('matchAssigned', { ...payload, opponentUserId: match.p1 });
     }
+    console.log('[TOURNAMENT] matchAssigned', match.matchId, `(p1=${match.p1}, p2=${match.p2}, room=${match.roomCode})`);
   },
 
   socketsForUser(userId) {
@@ -1732,7 +1811,26 @@ const tournamentEngine = {
     }
   },
 
+  // B22: best-effort username lookup from in-memory onlinePlayers.
+  _lookupUsernameSync(userId) {
+    if (!userId) return null;
+    for (const [, entry] of onlinePlayers) {
+      if (entry.userId === userId) return entry.username || entry.name || null;
+    }
+    return null;
+  },
+
   publicState(state) {
+    // B22: ensure the usernames map has an entry for every player we
+    // know about. Cheap to build each broadcast.
+    const usernames = { ...(state.usernames || {}) };
+    for (const uid of state.players) {
+      if (!usernames[uid]) {
+        const uname = this._lookupUsernameSync(uid);
+        if (uname) usernames[uid] = uname;
+      }
+    }
+
     return {
       id: state.id,
       code: state.code,
@@ -1748,6 +1846,7 @@ const tournamentEngine = {
       colorMap: state.colorMap,
       players: state.players,
       winnerId: state.winnerId,
+      usernames,                     // B22
       activeUserIds: Array.from(state.activeSet || []),
       activeSecondsLeft: state.activeDeadline
         ? Math.max(0, Math.ceil((state.activeDeadline - Date.now()) / 1000))
@@ -1771,7 +1870,7 @@ const tournamentEngine = {
 };
 
 // ════════════════════════════════════════════════════════════════
-// JWT middleware — ES256-only via Supabase JWKS (jose)
+// JWT middleware
 // ════════════════════════════════════════════════════════════════
 io.use(async (socket, next) => {
   const auth = socket.handshake.auth || {};
@@ -1841,8 +1940,7 @@ io.on('connection', (socket) => {
   socket.emit('connected', { playerId: socket.id });
 
   // ────────────────────────────────────────────────────────────
-  // identify — uses profiles.username / profiles.avatar
-  // Also ensures the user has at least one avatar (Chat 9d).
+  // identify
   // ────────────────────────────────────────────────────────────
   socket.on('identify', async (data) => {
     const uid = socket.data.userId;
@@ -1917,13 +2015,20 @@ io.on('connection', (socket) => {
       connectedAt: Date.now(),
     });
 
+    // B22: refresh the username in every tournament this user is in.
+    for (const [, t] of tournaments) {
+      if (t.players.includes(uid)) {
+        t.usernames = t.usernames || {};
+        t.usernames[uid] = user.username;
+      }
+    }
+
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
     const stats = await db.getOrCreateStats(uid);
     socket.emit('playerStats', { stats });
 
-    // ── Chat 9d: ensure at least one avatar exists. ──
     let avatars = [];
     try {
       avatars = await db.listAvatars(uid);
@@ -2018,7 +2123,7 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // checkUsernameAvailability (Chat 9d)
+  // checkUsernameAvailability
   // ────────────────────────────────────────────────────────────
   socket.on('checkUsernameAvailability', async (data) => {
     const raw = (data?.username || '').trim().slice(0, 15);
@@ -2147,6 +2252,16 @@ io.on('connection', (socket) => {
       onlineEntry.username = normalized;
     }
 
+    // B22: propagate to any tournament this user is in.
+    for (const [, t] of tournaments) {
+      if (t.players.includes(uid)) {
+        t.usernames = t.usernames || {};
+        t.usernames[uid] = newUsername;
+        this.broadcastState?.(t);   // safe no-op if not bound
+        io.to('tournament:' + t.id).emit('tournamentState', tournamentEngine.publicState(t));
+      }
+    }
+
     broadcastOnlineUsers();
 
     socket.emit('changeUsernameResult', {
@@ -2211,9 +2326,6 @@ io.on('connection', (socket) => {
     socket.emit('playerStats', { stats });
   });
 
-  // ────────────────────────────────────────────────────────────
-  // recordDojoMatch
-  // ────────────────────────────────────────────────────────────
   socket.on('recordDojoMatch', async (data) => {
     const uid = socket.data.userId;
     if (!uid) {
@@ -2662,13 +2774,9 @@ io.on('connection', (socket) => {
       roomCode = generateRoomCode();
     }
 
-    // Chat 11: a tournament match may pass a pre-created roomCode.
-    // If that room already exists (pre-created by the tournament
-    // engine), this socket joins it instead of creating a new one.
     const tournamentId = typeof data?.tournamentId === 'string' ? data.tournamentId : null;
     const tournamentMatchId = typeof data?.tournamentMatchId === 'string' ? data.tournamentMatchId : null;
     const requestedRoomCode = typeof data?.roomCode === 'string' ? data.roomCode.toUpperCase() : null;
-    const requestedWinTarget = Number.isFinite(Number(data?.winTarget)) ? Math.floor(Number(data.winTarget)) : null;
 
     if (tournamentId && requestedRoomCode && rooms.has(requestedRoomCode)) {
       const existing = rooms.get(requestedRoomCode);
@@ -2676,7 +2784,6 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: 'Room code conflict' });
         return;
       }
-      // Join the pre-created room.
       if (existing.players.includes(socket.id)) return;
       if (existing.players.length >= 2) {
         socket.emit('error', { message: 'Room is full' });
@@ -2703,11 +2810,9 @@ io.on('connection', (socket) => {
       socket.join(requestedRoomCode);
       socket.join('tournament:' + tournamentId);
 
-      // Refresh the room's winTarget from data if provided (authoritative
-      // value lives in tournament state, but the client sends it too).
-      if (requestedWinTarget !== null) {
-        existing.winTarget = requestedWinTarget;
-      }
+      // B21: winTarget is server-authoritative. Do NOT honor a client
+      // override here — the room already has the correct value from
+      // createTournamentRoom().
 
       broadcastRoomState(existing);
 
@@ -2770,7 +2875,7 @@ io.on('connection', (socket) => {
       aiState: null,
       tournamentId: tournamentId,
       tournamentMatchId: tournamentMatchId,
-      winTarget: requestedWinTarget !== null ? requestedWinTarget : WIN_TARGET,
+      winTarget: WIN_TARGET,     // B21: non-tournament rooms use the global default
     };
     rooms.set(roomCode, room);
 
@@ -2782,8 +2887,6 @@ io.on('connection', (socket) => {
 
     socket.join(roomCode);
 
-    // Chat 11: if in a tournament, join the tournament channel too so
-    // chat and bracket events reach this socket from the match screen.
     if (tournamentId) {
       socket.join('tournament:' + tournamentId);
     }
@@ -2850,7 +2953,6 @@ io.on('connection', (socket) => {
 
     socket.join(code);
 
-    // Chat 11: join the tournament channel too.
     if (room.tournamentId) {
       socket.join('tournament:' + room.tournamentId);
     }
@@ -2884,7 +2986,6 @@ io.on('connection', (socket) => {
 
     if (room.players.length === 2) {
       await snapshotRoomAvatars(room);
-      // Chat 11: notify the tournament engine that this match is ready.
       if (room.tournamentId) {
         tournamentEngine.onMatchReady(room);
       }
@@ -2932,7 +3033,7 @@ io.on('connection', (socket) => {
       pushRecentMove(room, p2, move2);
 
       let matchWinner = null;
-      const target = room.winTarget ?? WIN_TARGET;
+      const target = room.winTarget ?? WIN_TARGET;   // B21
       if (room.scores[p1] >= target) matchWinner = p1;
       else if (room.scores[p2] >= target) matchWinner = p2;
 
@@ -2956,9 +3057,10 @@ io.on('connection', (socket) => {
         recentMoves: buildRecentMovesPayload(room),
       });
 
-      // Chat 11: notify the tournament engine after the emit.
       if (room.tournamentId) {
-        tournamentEngine.onMatchProgress(room);
+        tournamentEngine.onMatchProgress(room).catch((e) =>
+          console.error('[TOURNAMENT] onMatchProgress error:', e?.message)
+        );
       }
 
       room.moves = {};
@@ -2972,9 +3074,6 @@ io.on('connection', (socket) => {
     const text = typeof data?.text === 'string' ? data.text : '';
     if (!text.trim()) return;
 
-    // Chat 11: tournament scoping.
-    // Priority 1: room message (with tournament mirror, if any).
-    // Priority 2: tournament channel message (lobby / bracket).
     const room = player.room ? rooms.get(player.room) : null;
 
     const message = {
@@ -2992,7 +3091,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // No active room: fall through to tournament channel if requested.
     const requestedId =
       typeof data?.tournamentId === 'string' ? data.tournamentId : null;
     if (requestedId && tournaments.has(requestedId)) {
@@ -3000,7 +3098,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Last resort: find any tournament this userId is in.
     const uid = socket.data.userId;
     if (uid) {
       for (const [, t] of tournaments) {
@@ -3019,7 +3116,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(player.room);
     if (!room) return;
 
-    // Chat 11: tournament matches do not support playAgain.
     if (room.tournamentId) return;
 
     if (room.avatarAutoTimer) {
@@ -3045,12 +3141,15 @@ io.on('connection', (socket) => {
     }
   });
 
+  // B6: leaveRoom only routes the tournament engine if the user is
+  // actually exiting via an explicit leave, not on screen unmount.
+  // TournamentMatchScreen no longer emits leaveRoom on unmount.
   socket.on('leaveRoom', () => {
     handleLeave(socket.id, true);
   });
 
   // ────────────────────────────────────────────────────────────
-  // TOURNAMENT EVENTS (Chat 11)
+  // TOURNAMENT EVENTS
   // ────────────────────────────────────────────────────────────
 
   socket.on('createTournament', async (data) => {
@@ -3197,7 +3296,6 @@ io.on('connection', (socket) => {
       socket.emit('tournamentState', null);
       return;
     }
-    // Auto-join the tournament channel so the socket receives updates.
     socket.join('tournament:' + state.id);
     socket.emit('tournamentState', tournamentEngine.publicState(state));
   });
@@ -3212,7 +3310,6 @@ function handleDisconnect(socketId) {
   const player = players.get(socketId);
   if (!player) return;
 
-  // Chat 11: notify the tournament engine before we clear state.
   tournamentEngine.onPlayerDisconnect(socketId).catch((e) =>
     console.error('[TOURNAMENT] onPlayerDisconnect error:', e?.message)
   );
@@ -3237,7 +3334,6 @@ function handleDisconnect(socketId) {
     room.avatarAutoTimer = null;
   }
 
-  // Chat 11: tournament rooms → immediate walkover, no 20s wait.
   if (room.tournamentId) {
     io.to(player.room).emit('playerLeft', { playerId: socketId });
     room.players = room.players.filter((id) => id !== socketId);
@@ -3299,10 +3395,12 @@ function handleLeave(socketId, notify = false) {
   const player = players.get(socketId);
   if (!player) return;
 
-  // Chat 11: notify the tournament engine.
-  tournamentEngine.onPlayerLeave(socketId).catch((e) =>
-    console.error('[TOURNAMENT] onPlayerLeave error:', e?.message)
-  );
+  // B6: only fire the tournament leave path for explicit leaves.
+  if (notify) {
+    tournamentEngine.onPlayerLeave(socketId).catch((e) =>
+      console.error('[TOURNAMENT] onPlayerLeave error:', e?.message)
+    );
+  }
 
   if (player.room) {
     const room = rooms.get(player.room);
