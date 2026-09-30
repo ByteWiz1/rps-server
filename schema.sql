@@ -10,6 +10,17 @@
 --   - avatars table now includes xp, titles, win_streak to fully mirror
 --     the client Avatar interface. image_url remains nullable and
 --     currently unused (custom images deferred).
+-- Chat 11: tournaments + tournament_rounds.
+--   - Two new tables appended at the bottom. Idempotent, safe to re-run.
+--   - Identity columns (hostId, players[], colorMap keys, matches.p1/p2)
+--     are text userIds, matching users."userId" / avatars."userId" /
+--     player_stats."userId". NOT uuid, NOT usernames.
+--   - No RLS on the new tables — service-role only, same as player_stats,
+--     match_history, achievements. The server is the sole writer.
+--   - tournament_rounds.tournamentId cascades on delete of tournaments.
+--   - tournaments.hostId has NO FK to users."userId" — intentional loose
+--     coupling so host promotion on disconnect and legacy migration do
+--     not accidentally cascade or block.
 --
 -- Run this ONCE in the Supabase SQL editor for a fresh project.
 -- Idempotent: safe to re-run.
@@ -266,13 +277,144 @@ create policy "avatars select own"
   for select
   using ("userId" = auth.uid()::text);
 
+-- ══════════════════════════════════════════════════════════════
+-- Chat 11 — tournaments
+-- ══════════════════════════════════════════════════════════════
+--
+-- Server-authoritative tournament state. In-memory mirror lives in
+-- server.js (`tournaments` Map + `tournamentCodes` Map). This table
+-- is the durable record so a restart / redeploy does not lose a
+-- tournament that is still in `lobby` status.
+--
+-- Identity columns use text userId (Supabase UID as text), matching
+-- users."userId" / avatars."userId" / player_stats."userId". They are
+-- NOT uuid and NOT usernames. This sidesteps the userId-vs-username
+-- matching bugs logged in PROJECT_STATE.md (Known Issues #2, #3).
+--
+-- No FK on hostId or players[]. hostId is transferred at runtime on
+-- host disconnect; players[] is a text[]. Loose coupling matches
+-- match_history."opponentId" (also a bare text).
+--
+-- status:
+--   'lobby'    — accepting joiners via code/link
+--   'live'     — started, bracket locked, rounds in progress
+--   'finished' — champion determined, rewards applied
+--
+-- type:
+--   'human'    — Human vs Human matches
+--   'avatar'   — Avatar vs Avatar matches
+--
+-- colorMap is jsonb keyed by userId: { "<userId>": "#RRGGBB", ... }.
+-- 32-color palette defined in server.js. One unique color per player,
+-- assigned randomly at tournament start.
+create table if not exists public.tournaments (
+  id             uuid        primary key default gen_random_uuid(),
+  code           text        not null unique,
+
+  "hostId"       text        not null,
+
+  type           text        not null,
+  "maxPlayers"   integer     not null,
+  "winTarget"    integer     not null,
+  "autoAdvance"  boolean     not null default true,
+  name           text,
+  "isPrivate"    boolean     not null default true,
+
+  status         text        not null default 'lobby',
+  "currentRound" integer     not null default 0,
+
+  "colorMap"     jsonb       not null default '{}'::jsonb,
+  players        text[]      not null default '{}',
+
+  "winnerId"     text,
+
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now(),
+
+  constraint tournaments_code_len_chk
+    check (char_length(code) = 6),
+  constraint tournaments_type_chk
+    check (type in ('human', 'avatar')),
+  constraint tournaments_status_chk
+    check (status in ('lobby', 'live', 'finished')),
+  constraint tournaments_max_players_chk
+    check ("maxPlayers" between 2 and 32),
+  constraint tournaments_win_target_chk
+    check ("winTarget" between 15 and 30)
+);
+
+create index if not exists tournaments_status_idx
+  on public.tournaments (status);
+
+create index if not exists tournaments_host_idx
+  on public.tournaments ("hostId");
+
+drop trigger if exists tournaments_bump_updated_at on public.tournaments;
+create trigger tournaments_bump_updated_at
+  before update on public.tournaments
+  for each row execute procedure public.bump_updated_at();
+
+-- ══════════════════════════════════════════════════════════════
+-- Chat 11 — tournament_rounds
+-- ══════════════════════════════════════════════════════════════
+--
+-- One row per round of a tournament. `matches` is a jsonb array of:
+--   {
+--     matchId:   string  (uuid),
+--     p1:        userId  (text),
+--     p2:        userId  (text),
+--     roomCode:  string | null,
+--     winner:    userId | null,
+--     status:    'pending' | 'active' | 'complete',
+--     scores:    { p1: number, p2: number, round: number }
+--   }
+--
+-- `bye` is the userId of the player who auto-advanced this round
+-- (or null if the round had an even number of players).
+--
+-- status:
+--   'pending'  — created, not yet started (Active window not open)
+--   'active'   — Active window open, matches running
+--   'complete' — all matches resolved, winners determined
+--
+-- tournamentId cascades on delete of tournaments.
+create table if not exists public.tournament_rounds (
+  id             uuid        primary key default gen_random_uuid(),
+  "tournamentId" uuid        not null
+    references public.tournaments(id) on delete cascade,
+
+  "roundNumber"  integer     not null,
+  matches        jsonb       not null default '[]'::jsonb,
+  bye            text,
+  status         text        not null default 'pending',
+
+  started_at     timestamptz,
+  completed_at   timestamptz,
+
+  constraint tournament_rounds_status_chk
+    check (status in ('pending', 'active', 'complete')),
+  constraint tournament_rounds_round_number_chk
+    check ("roundNumber" >= 1)
+);
+
+create unique index if not exists tournament_rounds_unique_round
+  on public.tournament_rounds ("tournamentId", "roundNumber");
+
+create index if not exists tournament_rounds_tid_idx
+  on public.tournament_rounds ("tournamentId", "roundNumber");
+
 -- ──────────────────────────────────────────────────────────────
 -- Notes
 -- ──────────────────────────────────────────────────────────────
 -- * gen_random_uuid() is available by default on Supabase.
 -- * Game timestamps remain bigint (Date.now() ms). Chat 9/9b tables
 --   (profiles, avatars, migration_log) use timestamptz defaults.
+--   Chat 11 tables (tournaments, tournament_rounds) follow the
+--   timestamptz convention.
 -- * auth_tokens is legacy. Do NOT drop until migrateLegacyToken has
 --   been confirmed unused in production.
 -- * public.users.username and public.profiles.username are duplicated
 --   and kept in sync by server.js. Known drift risk.
+-- * tournaments.hostId and tournaments.players[] intentionally have
+--   no FK. Host promotion on disconnect rewrites hostId at runtime;
+--   players[] is a text[] and cannot be a FK target.

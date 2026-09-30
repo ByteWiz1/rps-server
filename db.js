@@ -15,6 +15,14 @@
 //     avatar for users with zero avatars.
 //   - New renameDefaultAvatarIfNeeded(uid, newName) — renames a
 //     single "Guest"/"Player" avatar to the user's chosen name.
+// Chat 11: tournaments.
+//   - CRUD helpers for `tournaments` and `tournament_rounds`.
+//   - awardTournamentRewards(uid, { ratingDelta, xpDelta, title }).
+//   - calculateAvatarLevel(xp) mirrors avatarStore.calculateLevelLocal
+//     so server-written level matches what the client would compute.
+//   - migrateLegacyUser rewrites tournaments.hostId + players[] and
+//     colorMap keys. tournament_rounds.matches jsonb is NOT rewritten
+//     (known limitation — logged for a follow-up chat).
 //
 // Uses the SERVICE_ROLE key — the server is trusted. Never ship this
 // key to the client.
@@ -302,6 +310,40 @@ async function setPremium(uid, isPremium, sinceMs) {
 async function deleteUserEverywhere(uid) {
   if (!uid) return false;
 
+  // Best-effort: remove the user from any tournament they are in or
+  // host. tournament_rounds cascade-deletes when the tournament row
+  // is deleted. A live tournament they host will simply end; the
+  // in-memory engine in server.js handles the same case via
+  // handleDisconnect.
+  try {
+    const { data: hosted } = await supabase
+      .from('tournaments')
+      .select('id')
+      .eq('hostId', uid);
+
+    if (Array.isArray(hosted) && hosted.length > 0) {
+      const ids = hosted.map((r) => r.id);
+      await supabase.from('tournaments').delete().in('id', ids);
+    }
+
+    const { data: joined } = await supabase
+      .from('tournaments')
+      .select('id, players')
+      .contains('players', [uid]);
+
+    if (Array.isArray(joined)) {
+      for (const row of joined) {
+        const next = (row.players || []).filter((p) => p !== uid);
+        await supabase
+          .from('tournaments')
+          .update({ players: next })
+          .eq('id', row.id);
+      }
+    }
+  } catch (e) {
+    console.error('[DB] deleteUserEverywhere tournament cleanup:', e?.message);
+  }
+
   const { error: pubErr } = await supabase
     .from('users')
     .delete()
@@ -428,6 +470,51 @@ async function migrateLegacyUser(oldUserId, legacyToken) {
 
   if (avatarsErr) {
     console.error('[DB] migrateLegacyUser avatars rewrite error:', avatarsErr.message);
+  }
+
+  // Chat 11: rewrite tournaments.hostId, players[] and colorMap keys.
+  // tournament_rounds.matches jsonb is NOT rewritten — if a legacy user
+  // was mid-tournament, old rounds will show stale userIds. Logged for
+  // a follow-up chat.
+  try {
+    const { data: hostedTournaments } = await supabase
+      .from('tournaments')
+      .select('id')
+      .eq('hostId', oldUserId);
+
+    if (Array.isArray(hostedTournaments)) {
+      for (const t of hostedTournaments) {
+        await supabase
+          .from('tournaments')
+          .update({ hostId: newUid })
+          .eq('id', t.id);
+      }
+    }
+
+    const { data: joinedTournaments } = await supabase
+      .from('tournaments')
+      .select('id, players, colorMap')
+      .contains('players', [oldUserId]);
+
+    if (Array.isArray(joinedTournaments)) {
+      for (const t of joinedTournaments) {
+        const nextPlayers = (t.players || []).map((p) =>
+          p === oldUserId ? newUid : p
+        );
+        const oldColorMap = t.colorMap || {};
+        const nextColorMap = { ...oldColorMap };
+        if (Object.prototype.hasOwnProperty.call(nextColorMap, oldUserId)) {
+          nextColorMap[newUid] = nextColorMap[oldUserId];
+          delete nextColorMap[oldUserId];
+        }
+        await supabase
+          .from('tournaments')
+          .update({ players: nextPlayers, colorMap: nextColorMap })
+          .eq('id', t.id);
+      }
+    }
+  } catch (e) {
+    console.error('[DB] migrateLegacyUser tournaments rewrite error:', e?.message);
   }
 
   const { error: delOldErr } = await supabase
@@ -1066,6 +1153,382 @@ async function recordAvatarResult(userId, avatarId, won) {
 }
 
 // ────────────────────────────────────────────────────────────
+// Avatar level (mirrors avatarStore.calculateLevelLocal)
+// ────────────────────────────────────────────────────────────
+//
+// Kept in sync with the client's calculateLevelLocal so server-written
+// `level` matches what the client would compute from `xp`. If the
+// client table ever changes, update both. Logged as a maintenance
+// coupling in PROJECT_STATE.md.
+const AVATAR_LEVELS = [0, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+
+function calculateAvatarLevel(xp) {
+  const safe = typeof xp === 'number' && Number.isFinite(xp) ? xp : 0;
+  for (let i = AVATAR_LEVELS.length - 1; i >= 0; i--) {
+    if (safe >= AVATAR_LEVELS[i]) return i + 1;
+  }
+  return 1;
+}
+
+// ────────────────────────────────────────────────────────────
+// Tournament rewards (Chat 11)
+// ────────────────────────────────────────────────────────────
+//
+// Applies STEP 5 rewards to the user's SELECTED avatar:
+//   champion:      +50 rating, +500 XP, "Tournament Champion" title
+//   runner-up:     +25 rating, +250 XP
+//   semifinalist:  +10 rating, +100 XP
+//   participant:   +50 XP
+//
+// Rating is floored at 0. XP is floored at 0. Level is recomputed
+// from XP using AVATAR_LEVELS. Titles are deduped.
+//
+// Returns the refreshed avatar list (Array<ServerAvatar>) so the
+// caller can emit the existing `avatars` event, or null on failure.
+async function awardTournamentRewards(userId, opts = {}) {
+  if (!userId) return null;
+
+  const ratingDelta = Number.isFinite(opts.ratingDelta) ? opts.ratingDelta : 0;
+  const xpDelta = Number.isFinite(opts.xpDelta) ? opts.xpDelta : 0;
+  const title = typeof opts.title === 'string' && opts.title.trim()
+    ? opts.title.trim()
+    : null;
+
+  const selected = await getSelectedAvatar(userId);
+
+  // Fallback: if the user somehow has no selected avatar, pick the
+  // first one via listAvatars. If they have none at all, ensure a
+  // default avatar exists first.
+  let avatar = selected;
+  if (!avatar) {
+    let avatars = await listAvatars(userId);
+    if (!avatars || avatars.length === 0) {
+      await createDefaultAvatarForUser(userId, 'Player');
+      avatars = await listAvatars(userId);
+    }
+    avatar = avatars[0] || null;
+  }
+
+  if (!avatar) {
+    console.error('[DB] awardTournamentRewards: no avatar for', userId);
+    return null;
+  }
+
+  const newRating = Math.max(0, (avatar.rating || 0) + ratingDelta);
+  const newXP = Math.max(0, (avatar.xp || 0) + xpDelta);
+  const newLevel = calculateAvatarLevel(newXP);
+
+  let newTitles = Array.isArray(avatar.titles) ? [...avatar.titles] : [];
+  if (title && !newTitles.includes(title)) {
+    newTitles = [...newTitles, title];
+    if (newTitles.length > 25) {
+      // Cap to avoid unbounded growth; keep most recent.
+      newTitles = newTitles.slice(newTitles.length - 25);
+    }
+  }
+
+  const updated = await updateAvatar(userId, avatar.id, {
+    rating: newRating,
+    xp: newXP,
+    level: newLevel,
+    titles: newTitles,
+  });
+
+  if (!updated) {
+    console.error('[DB] awardTournamentRewards update failed for', userId);
+    return null;
+  }
+
+  console.log(
+    '[DB] tournament rewards →', userId,
+    `rating ${avatar.rating}→${newRating}`,
+    `xp ${avatar.xp}→${newXP}`,
+    `level ${avatar.level}→${newLevel}`,
+    title ? `title +"${title}"` : ''
+  );
+
+  const avatars = await listAvatars(userId);
+  return avatars;
+}
+
+// ────────────────────────────────────────────────────────────
+// Tournaments (Chat 11)
+// ────────────────────────────────────────────────────────────
+
+function rowToTournament(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    code: row.code,
+    hostId: row.hostId,
+    type: row.type,
+    maxPlayers: row.maxPlayers,
+    winTarget: row.winTarget,
+    autoAdvance: !!row.autoAdvance,
+    name: row.name || null,
+    isPrivate: !!row.isPrivate,
+    status: row.status,
+    currentRound: row.currentRound || 0,
+    colorMap: row.colorMap && typeof row.colorMap === 'object' ? row.colorMap : {},
+    players: Array.isArray(row.players) ? row.players : [],
+    winnerId: row.winnerId || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function createTournament({
+  code,
+  hostId,
+  type,
+  maxPlayers,
+  winTarget,
+  autoAdvance,
+  name,
+  isPrivate,
+}) {
+  if (!code || !hostId) return null;
+
+  const row = {
+    code,
+    hostId,
+    type,
+    maxPlayers,
+    winTarget,
+    autoAdvance: autoAdvance !== undefined ? !!autoAdvance : true,
+    name: name || null,
+    isPrivate: isPrivate !== undefined ? !!isPrivate : true,
+    status: 'lobby',
+    currentRound: 0,
+    colorMap: {},
+    players: [hostId],
+  };
+
+  const { data, error } = await supabase
+    .from('tournaments')
+    .insert(row)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[DB] createTournament error:', error.message);
+    return null;
+  }
+  return rowToTournament(data);
+}
+
+async function getTournamentById(id) {
+  if (!id) return null;
+
+  const { data, error } = await supabase
+    .from('tournaments')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getTournamentById error:', error.message);
+    return null;
+  }
+  return data ? rowToTournament(data) : null;
+}
+
+async function getTournamentByCode(code) {
+  if (!code) return null;
+
+  const { data, error } = await supabase
+    .from('tournaments')
+    .select('*')
+    .eq('code', code)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getTournamentByCode error:', error.message);
+    return null;
+  }
+  return data ? rowToTournament(data) : null;
+}
+
+async function listPublicTournaments() {
+  const { data, error } = await supabase
+    .from('tournaments')
+    .select('*')
+    .eq('isPrivate', false)
+    .eq('status', 'lobby')
+    .order('created_at', { ascending: false })
+    .limit(50);
+
+  if (error) {
+    console.error('[DB] listPublicTournaments error:', error.message);
+    return [];
+  }
+  return (data || []).map(rowToTournament);
+}
+
+async function updateTournament(id, patch) {
+  if (!id || !patch) return null;
+
+  const update = {};
+  if (patch.hostId !== undefined) update.hostId = patch.hostId;
+  if (patch.status !== undefined) update.status = patch.status;
+  if (patch.currentRound !== undefined) update.currentRound = patch.currentRound;
+  if (patch.colorMap !== undefined) update.colorMap = patch.colorMap;
+  if (patch.players !== undefined) update.players = patch.players;
+  if (patch.winnerId !== undefined) update.winnerId = patch.winnerId;
+  if (patch.name !== undefined) update.name = patch.name;
+
+  if (Object.keys(update).length === 0) {
+    return getTournamentById(id);
+  }
+
+  const { data, error } = await supabase
+    .from('tournaments')
+    .update(update)
+    .eq('id', id)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] updateTournament error:', error.message);
+    return null;
+  }
+  return data ? rowToTournament(data) : null;
+}
+
+async function deleteTournament(id) {
+  if (!id) return false;
+
+  const { error } = await supabase
+    .from('tournaments')
+    .delete()
+    .eq('id', id);
+
+  if (error) {
+    console.error('[DB] deleteTournament error:', error.message);
+    return false;
+  }
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────
+// Tournament rounds (Chat 11)
+// ────────────────────────────────────────────────────────────
+
+function rowToTournamentRound(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    tournamentId: row.tournamentId,
+    roundNumber: row.roundNumber,
+    matches: Array.isArray(row.matches) ? row.matches : [],
+    bye: row.bye || null,
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+  };
+}
+
+async function createTournamentRound({
+  tournamentId,
+  roundNumber,
+  matches,
+  bye,
+  status,
+}) {
+  if (!tournamentId || !roundNumber) return null;
+
+  const row = {
+    tournamentId,
+    roundNumber,
+    matches: Array.isArray(matches) ? matches : [],
+    bye: bye || null,
+    status: status || 'pending',
+  };
+
+  const { data, error } = await supabase
+    .from('tournament_rounds')
+    .insert(row)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[DB] createTournamentRound error:', error.message);
+    return null;
+  }
+  return rowToTournamentRound(data);
+}
+
+async function getTournamentRound(tournamentId, roundNumber) {
+  if (!tournamentId || !roundNumber) return null;
+
+  const { data, error } = await supabase
+    .from('tournament_rounds')
+    .select('*')
+    .eq('tournamentId', tournamentId)
+    .eq('roundNumber', roundNumber)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getTournamentRound error:', error.message);
+    return null;
+  }
+  return data ? rowToTournamentRound(data) : null;
+}
+
+async function listTournamentRounds(tournamentId) {
+  if (!tournamentId) return [];
+
+  const { data, error } = await supabase
+    .from('tournament_rounds')
+    .select('*')
+    .eq('tournamentId', tournamentId)
+    .order('roundNumber', { ascending: true });
+
+  if (error) {
+    console.error('[DB] listTournamentRounds error:', error.message);
+    return [];
+  }
+  return (data || []).map(rowToTournamentRound);
+}
+
+async function updateTournamentRound(
+  tournamentId,
+  roundNumber,
+  patch
+) {
+  if (!tournamentId || !roundNumber || !patch) return null;
+
+  const update = {};
+  if (patch.matches !== undefined) update.matches = patch.matches;
+  if (patch.status !== undefined) update.status = patch.status;
+  if (patch.bye !== undefined) update.bye = patch.bye;
+  if (patch.startedAt !== undefined) {
+    update.started_at = patch.startedAt;
+  }
+  if (patch.completedAt !== undefined) {
+    update.completed_at = patch.completedAt;
+  }
+
+  if (Object.keys(update).length === 0) {
+    return getTournamentRound(tournamentId, roundNumber);
+  }
+
+  const { data, error } = await supabase
+    .from('tournament_rounds')
+    .update(update)
+    .eq('tournamentId', tournamentId)
+    .eq('roundNumber', roundNumber)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] updateTournamentRound error:', error.message);
+    return null;
+  }
+  return data ? rowToTournamentRound(data) : null;
+}
+
+// ────────────────────────────────────────────────────────────
 // ACHIEVEMENTS
 // ────────────────────────────────────────────────────────────
 
@@ -1183,7 +1646,7 @@ function evaluateRules(stats) {
 
   const modeWinCounts = [humanWins, avatarWins, dojoWins];
   const maxModeWins = Math.max(...modeWinCounts, 0);
-  const minModeWins = Math.min(...modeWinCounts);
+  const minModeWins = Math.min(...modeWinCounts, 0);
 
   const rules = {
     first_win:          wins >= 1,
@@ -1342,6 +1805,24 @@ module.exports = {
   // avatars (Chat 9d)
   createDefaultAvatarForUser,
   renameDefaultAvatarIfNeeded,
+
+  // avatars (Chat 11)
+  calculateAvatarLevel,
+  awardTournamentRewards,
+
+  // tournaments (Chat 11)
+  createTournament,
+  getTournamentById,
+  getTournamentByCode,
+  listPublicTournaments,
+  updateTournament,
+  deleteTournament,
+
+  // tournament rounds (Chat 11)
+  createTournamentRound,
+  getTournamentRound,
+  listTournamentRounds,
+  updateTournamentRound,
 
   // achievements
   ACHIEVEMENT_CATALOG,
