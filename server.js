@@ -1307,7 +1307,8 @@ const tournamentEngine = {
       );
     }
 
-    this.broadcastScores(state, round);
+       this.broadcastScores(state, round);
+    this.broadcastState(state);   // keep bracket screens of waiting players fresh
     await this.persistRound(state, round);
 
     if (m.status === 'complete') {
@@ -3254,7 +3255,7 @@ io.on('connection', (socket) => {
       );
     }
 
-    if (!state) {
+        if (!state) {
       console.log(
         '[TOURNAMENT] getTournament — state not found | id:', id,
         '| code:', code, '| uid:', uid
@@ -3265,6 +3266,32 @@ io.on('connection', (socket) => {
 
     socket.join('tournament:' + state.id);
     socket.emit('tournamentState', tournamentEngine.publicState(state));
+
+    // If this user has an active match in the current round, re-emit
+    // matchAssigned to their sockets so a reconnecting client lands on
+    // the match screen instead of sitting on the bracket.
+    if (uid && state.status === 'live' && state.rounds.length > 0) {
+      const currentRound = state.rounds[state.rounds.length - 1];
+      for (const m of currentRound.matches) {
+        if (m.status === 'complete') continue;
+        if (m.p1 === uid || m.p2 === uid) {
+          const opponentUserId = m.p1 === uid ? m.p2 : m.p1;
+          const sockets = tournamentEngine.socketsForUser(uid);
+          for (const sid of sockets) {
+            io.to(sid).emit('matchAssigned', {
+              matchId: m.matchId,
+              roomCode: m.roomCode,
+              opponentUserId,
+            });
+          }
+          console.log(
+            '[TOURNAMENT] getTournament — re-emitted matchAssigned to uid:', uid,
+            '| match:', m.matchId, '| room:', m.roomCode
+          );
+          break;
+        }
+      }
+    }
   });
 
   socket.on('disconnect', () => {
