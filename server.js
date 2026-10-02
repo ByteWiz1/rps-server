@@ -3,42 +3,21 @@
 // RPS Arena — Node.js + Express + Socket.IO server.
 //
 // Chat 11e — Active window removed.
-//   The Active window (STEP 5) was causing state divergence: matched
-//   players were sent to the match screen before they could press
-//   Active, the BYE player's auto-active state didn't sync, and the
-//   countdown broadcast was silently dropped when a socket wasn't in
-//   the tournament room. The window was eliminating players who
-//   should have survived.
-//
-//   Replaced with a state-driven flow:
-//     - Round starts: shuffle + pair.
-//     - matchAssigned is emitted immediately to matched players.
-//     - BYE player advances silently (no button, no window).
-//     - Matches resolve. roundComplete fires when all matches are done.
-//     - Next round begins (autoAdvance) or host presses Begin.
-//     - Disconnect handling (already in place) is the only presence
-//       check. A disconnected player's match resolves as a walkover.
-//
-//   Deleted: openActiveWindow, closeActiveWindow, pressActive,
-//     the activeWindowUpdate tick, activeSet, activeDeadline,
-//     activeTickHandle, playerActive/playerInactive emits from the
-//     window path, ACTIVE_WINDOW_MS, ACTIVE_TICK_MS.
-//
-// Chat 12a — onboarding + identity model.
-//   - New socket event: resolveEmailFromUsername({ username }).
-//     Rate limited to 10 req/min per socket. Responds with
-//     { email } or { error: 'not_found' }. The client renders both
-//     the not-found and wrong-password cases as "Invalid credentials".
-//   - identify now reads profiles.is_guest as the authoritative
-//     guest flag. Falls back to the JWT heuristic only if the
-//     column is null (pre-migration rows).
-//   - selfRegistered payload now includes isGuest + email so the
-//     client store can populate hasSession/isGuest correctly.
-//   - changeUsername now calls db.syncUsername (atomic, both tables)
-//     instead of the old fire-and-forget profiles write.
-//   - On identify, if public.users.username and profiles.username
-//     differ, profiles is treated as authoritative and users is
-//     rewritten to match (drift heal — bug #15).
+// Chat 12a — Onboarding + identity model.
+//   - resolveEmailFromUsername socket event with per-socket rate limit.
+//   - identify reads profiles.is_guest as authoritative.
+//   - Drift heal between public.users and profiles.
+//   - changeUsername uses db.syncUsername (atomic).
+// Chat 12b — Bug C server-side.
+//   - checkUsernameAvailability now has a per-socket rate limit
+//     (30/min). Previously unlimited; typing 8 chars in a burst
+//     could fire 8 requests, and if Supabase was slow they could
+//     stack up.
+//   - The whole handler is wrapped in try/catch with a guaranteed
+//     response on every path (never leaves the client hanging).
+//   - New helper: checkUsernameRateLimit(socketId) with a rolling
+//     60s window, mirroring the resolveEmail rate limiter.
+//   - Cleanup on disconnect for both rate-limit maps.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -110,11 +89,15 @@ const recentOpponents = new Map();
 const tournaments = new Map();
 const tournamentCodes = new Map();
 
-// Chat 12a — per-socket rate limiting for resolveEmailFromUsername.
-// Map<socketId, number[]> of timestamps (ms). Pruned on each call.
+// Chat 12a — per-socket rate limit for resolveEmailFromUsername.
 const resolveEmailRateLimit = new Map();
 const RESOLVE_EMAIL_MAX_PER_MIN = 10;
 const RESOLVE_EMAIL_WINDOW_MS = 60_000;
+
+// Chat 12b — per-socket rate limit for checkUsernameAvailability.
+const checkUsernameRateLimit = new Map();
+const CHECK_USERNAME_MAX_PER_MIN = 30;
+const CHECK_USERNAME_WINDOW_MS = 60_000;
 
 // ─── Constants ───
 const WIN_TARGET = 30;
@@ -332,6 +315,21 @@ function checkResolveEmailRateLimit(socketId) {
   }
   fresh.push(now);
   resolveEmailRateLimit.set(socketId, fresh);
+  return true;
+}
+
+// ─── Chat 12b — rate limiter for checkUsernameAvailability ───
+function checkCheckUsernameRateLimit(socketId) {
+  const now = Date.now();
+  const cutoff = now - CHECK_USERNAME_WINDOW_MS;
+  const list = checkUsernameRateLimit.get(socketId) || [];
+  const fresh = list.filter((t) => t > cutoff);
+  if (fresh.length >= CHECK_USERNAME_MAX_PER_MIN) {
+    checkUsernameRateLimit.set(socketId, fresh);
+    return false;
+  }
+  fresh.push(now);
+  checkUsernameRateLimit.set(socketId, fresh);
   return true;
 }
 
@@ -837,20 +835,8 @@ function startAvatarAutoPlay(roomCode) {
 // ════════════════════════════════════════════════════════════════
 // TOURNAMENT ENGINE (Chat 11) — Active window removed
 // ════════════════════════════════════════════════════════════════
-//
-// Round lifecycle:
-//   1. beginRound: shuffle, pair, create rooms, emit roundStarted,
-//      emit matchAssigned to matched players, BYE advances silently.
-//   2. Matches run. onMatchProgress tracks scores.
-//   3. When all matches complete, checkRoundComplete fires. Round
-//      complete. Next round begins (autoAdvance) or host begins.
-//   4. Disconnect handling: _handleParticipantGone marks the affected
-//      match as a walkover. That's the only presence check.
 
 const tournamentEngine = {
-  // ────────────────────────────────────────────────────────
-  // createTournament
-  // ────────────────────────────────────────────────────────
   async create(userId, cfg) {
     console.log('[TOURNAMENT] create — enter | userId:', userId, '| cfg:', JSON.stringify(cfg));
     if (!userId) return { error: 'Not authenticated' };
@@ -925,9 +911,6 @@ const tournamentEngine = {
     return { tournamentId: state.id, code: state.code };
   },
 
-  // ────────────────────────────────────────────────────────
-  // get / hydrate
-  // ────────────────────────────────────────────────────────
   async get(tournamentId) {
     if (!tournamentId) return null;
     if (tournaments.has(tournamentId)) return tournaments.get(tournamentId);
@@ -974,9 +957,6 @@ const tournamentEngine = {
     return this.get(row.id);
   },
 
-  // ────────────────────────────────────────────────────────
-  // join
-  // ────────────────────────────────────────────────────────
   async join(userId, code) {
     console.log('[TOURNAMENT] join — enter | userId:', userId, '| code:', code);
     if (!userId) return { error: 'Not authenticated' };
@@ -1008,9 +988,6 @@ const tournamentEngine = {
     return { tournament: this.publicState(state) };
   },
 
-  // ────────────────────────────────────────────────────────
-  // leave (lobby only)
-  // ────────────────────────────────────────────────────────
   async leave(userId, tournamentId) {
     if (!userId || !tournamentId) return;
     const state = await this.get(tournamentId);
@@ -1039,9 +1016,6 @@ const tournamentEngine = {
     }
   },
 
-  // ────────────────────────────────────────────────────────
-  // start (host only)
-  // ────────────────────────────────────────────────────────
   async start(userId, tournamentId) {
     console.log('[TOURNAMENT] start — enter | userId:', userId, '| id:', tournamentId);
     if (!userId || !tournamentId) return { error: 'Not authenticated' };
@@ -1089,9 +1063,6 @@ const tournamentEngine = {
     return { ok: true };
   },
 
-  // ────────────────────────────────────────────────────────
-  // beginNextRound (host only, !autoAdvance)
-  // ────────────────────────────────────────────────────────
   async beginNextRound(userId, tournamentId) {
     console.log('[TOURNAMENT] beginNextRound — enter | userId:', userId, '| id:', tournamentId);
     if (!userId || !tournamentId) return { error: 'Not authenticated' };
@@ -1113,9 +1084,6 @@ const tournamentEngine = {
     return { ok: true };
   },
 
-  // ────────────────────────────────────────────────────────
-  // beginRound — pair, create rooms, emit matchAssigned, advance BYE
-  // ────────────────────────────────────────────────────────
   async beginRound(state) {
     if (!state) return;
     console.log(
@@ -1179,7 +1147,7 @@ const tournamentEngine = {
       roundNumber,
       matches,
       bye,
-      status: 'active',        // no window; round is immediately active
+      status: 'active',
       startedAt: Date.now(),
       completedAt: null,
       _completing: false,
@@ -1225,19 +1193,12 @@ const tournamentEngine = {
       (io.sockets.adapter.rooms.get('tournament:' + state.id) || { size: 0 }).size
     );
 
-    // Emit matchAssigned immediately to matched players. BYE player
-    // does not get a matchAssigned.
     for (const m of matches) {
       this.emitMatchAssigned(state, m);
     }
 
     this.broadcastScores(state, round);
 
-    // If there are no matches (only possible with 1 active player,
-    // which we already handled), we'd advance. For 2+ players, at
-    // least one match exists or we're at the championship. This
-    // defensive path fires for tournaments that reach 2 players with
-    // a BYE — theoretically impossible but safe.
     if (matches.length === 0 && bye) {
       console.log('[TOURNAMENT] beginRound — no matches, only a BYE. Advancing.');
       await this.finishTournament(state, bye);
@@ -1250,9 +1211,6 @@ const tournamentEngine = {
     );
   },
 
-  // ────────────────────────────────────────────────────────
-  // createTournamentRoom
-  // ────────────────────────────────────────────────────────
   createTournamentRoom(state, match) {
     const roomCode = match.roomCode;
     if (!roomCode) return;
@@ -1286,9 +1244,6 @@ const tournamentEngine = {
     );
   },
 
-  // ────────────────────────────────────────────────────────
-  // onMatchReady
-  // ────────────────────────────────────────────────────────
   async onMatchReady(room) {
     if (!room || !room.tournamentId || !room.tournamentMatchId) return;
     const state = await this.get(room.tournamentId);
@@ -1304,9 +1259,6 @@ const tournamentEngine = {
     this.broadcastScores(state, round);
   },
 
-  // ────────────────────────────────────────────────────────
-  // onMatchProgress
-  // ────────────────────────────────────────────────────────
   async onMatchProgress(room) {
     if (!room || !room.tournamentId || !room.tournamentMatchId) return;
     const state = await this.get(room.tournamentId);
@@ -1344,8 +1296,8 @@ const tournamentEngine = {
       );
     }
 
-       this.broadcastScores(state, round);
-    this.broadcastState(state);   // keep bracket screens of waiting players fresh
+    this.broadcastScores(state, round);
+    this.broadcastState(state);
     await this.persistRound(state, round);
 
     if (m.status === 'complete') {
@@ -1353,9 +1305,6 @@ const tournamentEngine = {
     }
   },
 
-  // ────────────────────────────────────────────────────────
-  // onPlayerDisconnect / onPlayerLeave
-  // ────────────────────────────────────────────────────────
   async onPlayerDisconnect(socketId) {
     const uid = onlinePlayers.get(socketId)?.userId ||
                 players.get(socketId)?.userId ||
@@ -1387,7 +1336,6 @@ const tournamentEngine = {
       '| status:', state.status
     );
 
-    // If this user still has another live socket, do NOT remove them.
     let otherSocketCount = 0;
     for (const [sid, entry] of onlinePlayers) {
       if (entry.userId === userId && sid !== socketId) {
@@ -1402,7 +1350,6 @@ const tournamentEngine = {
       return;
     }
 
-    // In lobby: just remove and let the leave path handle host promotion.
     if (state.status === 'lobby') {
       state.players = state.players.filter((p) => p !== userId);
       if (state.hostId === userId && state.players.length > 0) {
@@ -1416,8 +1363,6 @@ const tournamentEngine = {
       return;
     }
 
-    // Live tournament: remove from players, resolve their match as a
-    // walkover, advance the round if possible.
     state.players = state.players.filter((p) => p !== userId);
 
     if (state.hostId === userId && state.players.length > 0) {
@@ -1455,9 +1400,6 @@ const tournamentEngine = {
     if (round) await this.checkRoundComplete(state, round);
   },
 
-  // ────────────────────────────────────────────────────────
-  // _cancelTournamentRoom
-  // ────────────────────────────────────────────────────────
   _cancelTournamentRoom(match, winnerUserId, reason) {
     if (!match || !match.roomCode) return;
     const room = rooms.get(match.roomCode);
@@ -1493,9 +1435,6 @@ const tournamentEngine = {
     );
   },
 
-  // ────────────────────────────────────────────────────────
-  // checkRoundComplete
-  // ────────────────────────────────────────────────────────
   async checkRoundComplete(state, round) {
     if (!round || round.status === 'complete') return;
     if (round._completing) return;
@@ -1565,9 +1504,6 @@ const tournamentEngine = {
     }
   },
 
-  // ────────────────────────────────────────────────────────
-  // finishTournament
-  // ────────────────────────────────────────────────────────
   async finishTournament(state, championUserId) {
     if (!state) return;
     if (state.status === 'finished') return;
@@ -1601,9 +1537,6 @@ const tournamentEngine = {
     }, 10 * 60 * 1000);
   },
 
-  // ────────────────────────────────────────────────────────
-  // applyRewards
-  // ────────────────────────────────────────────────────────
   async applyRewards(state, championUserId) {
     const rewards = {};
 
@@ -1674,9 +1607,6 @@ const tournamentEngine = {
     return rewards;
   },
 
-  // ────────────────────────────────────────────────────────
-  // broadcast helpers
-  // ────────────────────────────────────────────────────────
   broadcastState(state) {
     if (!state) return;
     const roomSize = (io.sockets.adapter.rooms.get('tournament:' + state.id) || { size: 0 }).size;
@@ -1740,9 +1670,6 @@ const tournamentEngine = {
     return out;
   },
 
-  // ────────────────────────────────────────────────────────
-  // helpers
-  // ────────────────────────────────────────────────────────
   shuffle(arr) {
     const a = [...arr];
     for (let i = a.length - 1; i > 0; i--) {
@@ -1814,8 +1741,6 @@ const tournamentEngine = {
       players: state.players,
       winnerId: state.winnerId,
       usernames,
-      // Active fields kept as empty for compatibility with clients that
-      // still read them. No client should depend on them anymore.
       activeUserIds: [],
       activeSecondsLeft: 0,
       rounds: state.rounds.map((r) => ({
@@ -1940,11 +1865,7 @@ io.on('connection', (socket) => {
     const clientUsernameRaw = (data?.username || '').trim().slice(0, 15);
     const clientAvatar = data?.avatar || null;
 
-    // Chat 12a — drift heal.
-    //
-    // If public.users.username and profiles.username differ,
-    // profiles is authoritative (it is what sign-in resolves against).
-    // Rewrite users to match. Log the event.
+    // Drift heal.
     let usernameToUse = profile?.username || null;
     try {
       const account = await db.getUserById(uid);
@@ -2071,12 +1992,7 @@ io.on('connection', (socket) => {
 
     socket.emit('avatars', { avatars });
 
-    // Chat 12a — resolve guest/member from profiles.is_guest.
-    //
-    // profiles.is_guest is authoritative. Fall back to the JWT
-    // heuristic only if is_guest is null/undefined (pre-migration
-    // rows). Registered signups and linked accounts have
-    // is_guest = false; anonymous users have is_guest = true.
+    // Resolve guest/member from profiles.is_guest.
     const payload = socket.data.jwtPayload || {};
     const meta = payload.user_metadata || {};
     const jwtSaysAnon = !payload.email || meta.is_anonymous === true;
@@ -2103,24 +2019,7 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // resolveEmailFromUsername (Chat 12a)
-  //
-  // Used by LoginScreen to allow signing in with either an email
-  // or a username. If the value does not contain '@', the client
-  // calls this to resolve the email, then calls
-  // signInWithPassword({ email, password }) itself.
-  //
-  // Security:
-  //   - Rate limited to 10 req/min per socket.
-  //   - Never differentiates "username not found" from "user is a
-  //     guest" — both return { error: 'not_found' }. The client
-  //     renders "Invalid credentials".
-  //   - The email is returned in full. It must be, so the client
-  //     can pass it to Supabase. This is a considered trade-off:
-  //     rate limiting makes enumeration impractical, and the
-  //     subsequent signInWithPassword is what actually gates
-  //     access. See PROJECT_STATE.md "Known Issues" for the
-  //     residual risk.
+  // resolveEmailFromUsername
   // ────────────────────────────────────────────────────────────
   socket.on('resolveEmailFromUsername', async (data) => {
     if (!checkResolveEmailRateLimit(socket.id)) {
@@ -2209,9 +2108,25 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // checkUsernameAvailability
+  // checkUsernameAvailability (Chat 12b — rate limited + try/catch)
   // ────────────────────────────────────────────────────────────
   socket.on('checkUsernameAvailability', async (data) => {
+    // Rate limit. The client debounces at 300ms and 30/min is a
+    // comfortable ceiling for normal typing. If a client is firing
+    // faster than that, they are either buggy or malicious — respond
+    // with a definite negative so the UI does not hang.
+    if (!checkCheckUsernameRateLimit(socket.id)) {
+      console.log(
+        '[USERNAME CHECK] rate limited | socket:', socket.id
+      );
+      socket.emit('usernameAvailability', {
+        username: (data?.username || '').slice(0, 15),
+        available: false,
+        message: 'Too many checks — try again in a moment',
+      });
+      return;
+    }
+
     const raw = (data?.username || '').trim().slice(0, 15);
     const normalized = normalizeUsername(raw);
 
@@ -2243,22 +2158,19 @@ io.on('connection', (socket) => {
         message: available ? undefined : 'That username is already taken',
       });
     } catch (e) {
+      // Never leave the client hanging. Emit a definite negative
+      // with a clear message.
       console.error('[USERNAME CHECK] error:', e?.message);
       socket.emit('usernameAvailability', {
         username: raw,
         available: false,
-        message: 'Could not check availability',
+        message: 'Could not check availability — try again',
       });
     }
   });
 
   // ────────────────────────────────────────────────────────────
   // changeUsername
-  //
-  // Chat 12a — now calls db.syncUsername (atomic write to BOTH
-  // public.users and public.profiles). Replaces the old
-  // fire-and-forget updateProfileUsername call that was the source
-  // of bug #15.
   // ────────────────────────────────────────────────────────────
   socket.on('changeUsername', async (data) => {
     const uid = socket.data.userId;
@@ -2316,7 +2228,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Chat 12a — atomic sync. Fails loudly on partial write.
     const syncResult = await db.syncUsername(uid, normalized);
     if (!syncResult.ok) {
       console.error('[CHANGE USERNAME] syncUsername failed:', syncResult.message);
@@ -3328,8 +3239,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // pressActive is no longer used. Kept as a no-op so any stale client
-  // that still emits it doesn't crash. The tournament engine ignores it.
   socket.on('pressActive', () => {
     // No-op — Active window removed.
   });
@@ -3393,7 +3302,7 @@ io.on('connection', (socket) => {
       );
     }
 
-        if (!state) {
+    if (!state) {
       console.log(
         '[TOURNAMENT] getTournament — state not found | id:', id,
         '| code:', code, '| uid:', uid
@@ -3405,9 +3314,6 @@ io.on('connection', (socket) => {
     socket.join('tournament:' + state.id);
     socket.emit('tournamentState', tournamentEngine.publicState(state));
 
-    // If this user has an active match in the current round, re-emit
-    // matchAssigned to their sockets so a reconnecting client lands on
-    // the match screen instead of sitting on the bracket.
     if (uid && state.status === 'live' && state.rounds.length > 0) {
       const currentRound = state.rounds[state.rounds.length - 1];
       for (const m of currentRound.matches) {
@@ -3435,6 +3341,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('[DISCONNECT]', socket.id);
     resolveEmailRateLimit.delete(socket.id);
+    checkUsernameRateLimit.delete(socket.id);
     handleDisconnect(socket.id);
   });
 });
@@ -3574,3 +3481,4 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+// rps-server/server.js
