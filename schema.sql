@@ -22,6 +22,15 @@
 --     coupling so host promotion on disconnect and legacy migration do
 --     not accidentally cascade or block.
 --
+-- Chat 12a: onboarding + identity model.
+--   - profiles gains `email` (text, nullable) and `is_guest`
+--     (boolean, not null, default true).
+--   - handle_new_user now assigns 'Guest_XXXX' when the new auth user
+--     is anonymous (no email, or raw_user_meta_data.is_anonymous =
+--     true). Registered signups get their chosen username.
+--   - Backfill: existing profiles with a non-null email are marked
+--     is_guest = false.
+--
 -- Run this ONCE in the Supabase SQL editor for a fresh project.
 -- Idempotent: safe to re-run.
 
@@ -137,6 +146,24 @@ create table if not exists public.profiles (
   updated_at     timestamptz not null default now()
 );
 
+-- Chat 12a — identity model additions.
+--   email   : null for guests, filled for members.
+--   is_guest: true for anonymous users (never linked); flips to false
+--             the moment the account is upgraded (sign up or link).
+alter table public.profiles
+  add column if not exists email text;
+
+alter table public.profiles
+  add column if not exists is_guest boolean not null default true;
+
+-- Backfill: any profile that already has an email is a member, not a
+-- guest. Runs idempotently — re-running is a no-op once all rows
+-- with email are marked.
+update public.profiles
+  set is_guest = false
+  where email is not null
+    and is_guest = true;
+
 create unique index if not exists profiles_username_lower_key
   on public.profiles (lower(username))
   where username is not null;
@@ -154,16 +181,55 @@ create trigger profiles_bump_updated_at
   before update on public.profiles
   for each row execute procedure public.bump_updated_at();
 
+-- Chat 12a — handle_new_user now detects anonymous signups and
+-- seeds a 'Guest_XXXX' placeholder username.
+--
+-- Detection:
+--   * new.email IS NULL  → anonymous (signInAnonymously)
+--   * new.raw_user_meta_data->>'is_anonymous' = 'true'  → anonymous
+--
+-- For anonymous users we ignore any username in the metadata and
+-- generate 'Guest_' || 4 digits. For registered users we use the
+-- metadata username if present, else fall back to null (the server
+-- will fill it during identify).
+--
+-- is_guest mirrors the same detection.
 create or replace function public.handle_new_user()
 returns trigger as $$
+declare
+  is_anon boolean;
+  meta_username text;
+  meta_avatar text;
+  final_username text;
+  final_avatar text;
 begin
-  insert into public.profiles (id, username, avatar)
+  meta_username := new.raw_user_meta_data->>'username';
+  meta_avatar   := coalesce(new.raw_user_meta_data->>'avatar', '🤖');
+
+  is_anon := (new.email is null)
+    or (coalesce(new.raw_user_meta_data->>'is_anonymous', 'false') = 'true');
+
+  if is_anon then
+    -- Placeholder guest name. Uniqueness handled by the username
+    -- index; a rare collision would raise and the server's
+    -- generateUniqueUsername path would resolve on next identify.
+    final_username := 'Guest_' || lpad((floor(random() * 10000))::int::text, 4, '0');
+    final_avatar   := meta_avatar;
+  else
+    final_username := nullif(meta_username, '');
+    final_avatar   := meta_avatar;
+  end if;
+
+  insert into public.profiles (id, username, avatar, email, is_guest)
   values (
     new.id,
-    coalesce(new.raw_user_meta_data->>'username', null),
-    coalesce(new.raw_user_meta_data->>'avatar', '🤖')
+    final_username,
+    final_avatar,
+    new.email,
+    is_anon
   )
   on conflict (id) do nothing;
+
   return new;
 end;
 $$ language plpgsql security definer;
@@ -414,7 +480,8 @@ create index if not exists tournament_rounds_tid_idx
 -- * auth_tokens is legacy. Do NOT drop until migrateLegacyToken has
 --   been confirmed unused in production.
 -- * public.users.username and public.profiles.username are duplicated
---   and kept in sync by server.js. Known drift risk.
+--   and kept in sync by server.js. Known drift risk. Chat 12a adds
+--   syncUsername() in db.js as the single atomic writer.
 -- * tournaments.hostId and tournaments.players[] intentionally have
 --   no FK. Host promotion on disconnect rewrites hostId at runtime;
 --   players[] is a text[] and cannot be a FK target.

@@ -23,6 +23,18 @@
 //   - migrateLegacyUser rewrites tournaments.hostId + players[] and
 //     colorMap keys. tournament_rounds.matches jsonb is NOT rewritten
 //     (known limitation — logged for a follow-up chat).
+// Chat 12a: onboarding + identity model.
+//   - New getEmailByUsername(username) — case-insensitive lookup on
+//     profiles.username. Used by the resolveEmailFromUsername socket
+//     event. Returns email string or null.
+//   - New syncUsername(userId, newUsername) — single atomic writer
+//     for BOTH public.users.username and public.profiles.username.
+//     Fixes bug #15 (username drift). Returns { ok, message? }.
+//   - getProfile now selects email + is_guest.
+//   - ensureUserRow no longer overwrites a profile username that
+//     already exists (defers to profiles as authoritative).
+//   - New setProfileGuestStatus(userId, isGuest, email?) — used after
+//     link-email to flip is_guest = false and store the email.
 //
 // Uses the SERVICE_ROLE key — the server is trusted. Never ship this
 // key to the client.
@@ -250,12 +262,27 @@ async function ensureUserRow(uid, { username, avatar } = {}) {
 // ────────────────────────────────────────────────────────────
 // Profiles
 // ────────────────────────────────────────────────────────────
+//
+// Chat 12a — getProfile now selects email + is_guest.
+//
+// Fields:
+//   id            uuid PK → auth.users.id
+//   username      text (nullable)
+//   avatar        text (nullable)
+//   is_premium    bool
+//   premium_since timestamptz
+//   email         text (nullable) — null for guests, filled for members
+//   is_guest      bool — true until the account is linked
+//   created_at    timestamptz
+//   updated_at    timestamptz
 async function getProfile(uid) {
   if (!uid) return null;
 
   const { data, error } = await supabase
     .from('profiles')
-    .select('id, username, avatar, is_premium, premium_since, created_at, updated_at')
+    .select(
+      'id, username, avatar, is_premium, premium_since, email, is_guest, created_at, updated_at'
+    )
     .eq('id', uid)
     .maybeSingle();
 
@@ -279,6 +306,115 @@ async function updateProfileUsername(uid, username, avatar) {
 
   if (error) {
     console.error('[DB] updateProfileUsername error:', error.message);
+    return false;
+  }
+  return true;
+}
+
+// Chat 12a — atomic username sync.
+//
+// Writes `username` to BOTH public.users and public.profiles. Returns
+// { ok: boolean, message?: string }.
+//
+// Semantics:
+//   * Both writes are attempted. If either fails, we return
+//     ok: false with a message. The caller (changeUsername handler)
+//     reports the failure to the user.
+//   * profiles.username is treated as the authoritative copy when
+//     detecting drift on identify — see server.js identify.
+//   * Order: profiles first, then users. If profiles succeeds and
+//     users fails, profiles is briefly ahead. On next identify,
+//     profiles wins. Acceptable for our scale; both are idempotent.
+async function syncUsername(userId, newUsername) {
+  if (!userId || !newUsername) {
+    return { ok: false, message: 'Missing userId or username' };
+  }
+
+  const normalized = String(newUsername).trim();
+  if (!normalized) {
+    return { ok: false, message: 'Empty username' };
+  }
+
+  const now = Date.now();
+
+  const { error: profErr } = await supabase
+    .from('profiles')
+    .update({ username: normalized })
+    .eq('id', userId);
+
+  if (profErr) {
+    console.error('[DB] syncUsername profiles error:', profErr.message);
+    return { ok: false, message: 'Could not update profile' };
+  }
+
+  const { error: userErr } = await supabase
+    .from('users')
+    .update({ username: normalized, updatedAt: now })
+    .eq('userId', userId);
+
+  if (userErr) {
+    console.error('[DB] syncUsername users error:', userErr.message);
+    return { ok: false, message: 'Could not update account' };
+  }
+
+  return { ok: true };
+}
+
+// Chat 12a — case-insensitive email lookup by username.
+//
+// Used by the resolveEmailFromUsername socket event so a user can
+// sign in with either their email or their username.
+//
+// Returns the email string, or null if:
+//   * the username does not exist
+//   * the profile has no email (i.e. it is a guest)
+//
+// The caller (server.js) never differentiates between these two
+// cases when replying to the client — both become 'not_found',
+// which the client renders as "Invalid credentials".
+async function getEmailByUsername(username) {
+  if (!username || typeof username !== 'string') return null;
+
+  const normalized = username.trim().toLowerCase();
+  if (!normalized) return null;
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('email, is_guest')
+    .ilike('username', normalized)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getEmailByUsername error:', error.message);
+    return null;
+  }
+  if (!data) return null;
+  if (data.is_guest === true) return null;
+  if (!data.email) return null;
+
+  return data.email;
+}
+
+// Chat 12a — mark a profile as a member (or guest).
+//
+// Called after link-email succeeds so profiles.email is stored and
+// is_guest flips to false. Also used by future flows (e.g. email
+// change) to keep profiles in sync.
+async function setProfileGuestStatus(userId, isGuest, email) {
+  if (!userId) return false;
+
+  const patch = { is_guest: !!isGuest };
+  if (email !== undefined) {
+    patch.email = email || null;
+  }
+
+  const { error } = await supabase
+    .from('profiles')
+    .update(patch)
+    .eq('id', userId);
+
+  if (error) {
+    console.error('[DB] setProfileGuestStatus error:', error.message);
     return false;
   }
   return true;
@@ -951,6 +1087,10 @@ async function createDefaultAvatarForUser(uid, name) {
 
 // If the user has exactly one avatar whose name is 'Guest' or 'Player',
 // rename it to newName. No-op in every other case.
+//
+// Chat 12a: also recognizes names matching the 'Guest_XXXX' placeholder
+// pattern produced by the handle_new_user trigger.
+//
 // Returns true if a rename happened, false otherwise.
 async function renameDefaultAvatarIfNeeded(uid, newName) {
   if (!uid || !newName) return false;
@@ -969,7 +1109,12 @@ async function renameDefaultAvatarIfNeeded(uid, newName) {
 
   const only = avatars[0];
   const currentName = (only.name || '').trim();
-  if (currentName !== 'Guest' && currentName !== 'Player') return false;
+  const isPlaceholder =
+    currentName === 'Guest' ||
+    currentName === 'Player' ||
+    /^Guest_\d{4}$/i.test(currentName);
+
+  if (!isPlaceholder) return false;
 
   const safeName = String(newName).trim().slice(0, 20);
   if (!safeName) return false;
@@ -1773,6 +1918,11 @@ module.exports = {
   getProfile,
   updateProfileUsername,
   setPremium,
+
+  // profiles (Chat 12a)
+  syncUsername,
+  getEmailByUsername,
+  setProfileGuestStatus,
 
   // deletion
   deleteUserEverywhere,

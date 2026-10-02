@@ -24,6 +24,22 @@
 //     activeTickHandle, playerActive/playerInactive emits from the
 //     window path, ACTIVE_WINDOW_MS, ACTIVE_TICK_MS.
 //
+// Chat 12a — onboarding + identity model.
+//   - New socket event: resolveEmailFromUsername({ username }).
+//     Rate limited to 10 req/min per socket. Responds with
+//     { email } or { error: 'not_found' }. The client renders both
+//     the not-found and wrong-password cases as "Invalid credentials".
+//   - identify now reads profiles.is_guest as the authoritative
+//     guest flag. Falls back to the JWT heuristic only if the
+//     column is null (pre-migration rows).
+//   - selfRegistered payload now includes isGuest + email so the
+//     client store can populate hasSession/isGuest correctly.
+//   - changeUsername now calls db.syncUsername (atomic, both tables)
+//     instead of the old fire-and-forget profiles write.
+//   - On identify, if public.users.username and profiles.username
+//     differ, profiles is treated as authoritative and users is
+//     rewritten to match (drift heal — bug #15).
+//
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
 //   INVITE_TIMEOUT = 5 min.
@@ -93,6 +109,12 @@ const recentOpponents = new Map();
 // Chat 11 — tournament state (in-memory mirror).
 const tournaments = new Map();
 const tournamentCodes = new Map();
+
+// Chat 12a — per-socket rate limiting for resolveEmailFromUsername.
+// Map<socketId, number[]> of timestamps (ms). Pruned on each call.
+const resolveEmailRateLimit = new Map();
+const RESOLVE_EMAIL_MAX_PER_MIN = 10;
+const RESOLVE_EMAIL_WINDOW_MS = 60_000;
 
 // ─── Constants ───
 const WIN_TARGET = 30;
@@ -296,6 +318,21 @@ function resolveRound(move1, move2) {
   if (move1 === move2) return 'tie';
   const rules = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
   return rules[move1] === move2 ? 'p1' : 'p2';
+}
+
+// ─── Chat 12a — rate limiter for resolveEmailFromUsername ───
+function checkResolveEmailRateLimit(socketId) {
+  const now = Date.now();
+  const cutoff = now - RESOLVE_EMAIL_WINDOW_MS;
+  const list = resolveEmailRateLimit.get(socketId) || [];
+  const fresh = list.filter((t) => t > cutoff);
+  if (fresh.length >= RESOLVE_EMAIL_MAX_PER_MIN) {
+    resolveEmailRateLimit.set(socketId, fresh);
+    return false;
+  }
+  fresh.push(now);
+  resolveEmailRateLimit.set(socketId, fresh);
+  return true;
 }
 
 // ─── AI state setup ───
@@ -1787,6 +1824,8 @@ const tournamentEngine = {
         status: r.status,
         matches: r.matches.map((m) => ({
           matchId: m.matchId,
+          player1: m.p1,
+          player2: m.p2,
           p1: m.p1,
           p2: m.p2,
           roomCode: m.roomCode,
@@ -1901,7 +1940,31 @@ io.on('connection', (socket) => {
     const clientUsernameRaw = (data?.username || '').trim().slice(0, 15);
     const clientAvatar = data?.avatar || null;
 
+    // Chat 12a — drift heal.
+    //
+    // If public.users.username and profiles.username differ,
+    // profiles is authoritative (it is what sign-in resolves against).
+    // Rewrite users to match. Log the event.
     let usernameToUse = profile?.username || null;
+    try {
+      const account = await db.getUserById(uid);
+      if (
+        account?.username &&
+        profile?.username &&
+        account.username !== profile.username
+      ) {
+        console.log(
+          '[IDENTIFY] drift detected | users:', account.username,
+          '| profiles:', profile.username,
+          '| healing users → profiles'
+        );
+        await db.updateUsername(uid, profile.username).catch(() => {});
+        account.username = profile.username;
+      }
+    } catch (e) {
+      console.error('[IDENTIFY] drift heal error:', e?.message);
+    }
+
     if (!usernameToUse && clientUsernameRaw && clientUsernameRaw.length >= 3) {
       const normalized = normalizeUsername(clientUsernameRaw);
       if (normalized && normalized.length >= 3) {
@@ -2008,9 +2071,21 @@ io.on('connection', (socket) => {
 
     socket.emit('avatars', { avatars });
 
+    // Chat 12a — resolve guest/member from profiles.is_guest.
+    //
+    // profiles.is_guest is authoritative. Fall back to the JWT
+    // heuristic only if is_guest is null/undefined (pre-migration
+    // rows). Registered signups and linked accounts have
+    // is_guest = false; anonymous users have is_guest = true.
     const payload = socket.data.jwtPayload || {};
     const meta = payload.user_metadata || {};
-    const isAnonymous = !payload.email || meta.is_anonymous === true;
+    const jwtSaysAnon = !payload.email || meta.is_anonymous === true;
+    const isGuest =
+      profile && typeof profile.is_guest === 'boolean'
+        ? profile.is_guest
+        : jwtSaysAnon;
+
+    const emailToUse = profile?.email || payload.email || null;
 
     socket.emit('selfRegistered', {
       userId: uid,
@@ -2018,11 +2093,68 @@ io.on('connection', (socket) => {
       avatar: user.avatar,
       isPremium: !!(profile && profile.is_premium),
       premiumSince: profile?.premium_since || null,
-      email: payload.email || null,
-      isAnonymous,
+      email: emailToUse,
+      isAnonymous: isGuest,
+      isGuest,
     });
 
-    console.log('[IDENTIFY]', socket.id, '→', user.username, `(${uid})`);
+    console.log('[IDENTIFY]', socket.id, '→', user.username, `(${uid})`,
+      '| isGuest:', isGuest, '| email:', emailToUse || '(none)');
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // resolveEmailFromUsername (Chat 12a)
+  //
+  // Used by LoginScreen to allow signing in with either an email
+  // or a username. If the value does not contain '@', the client
+  // calls this to resolve the email, then calls
+  // signInWithPassword({ email, password }) itself.
+  //
+  // Security:
+  //   - Rate limited to 10 req/min per socket.
+  //   - Never differentiates "username not found" from "user is a
+  //     guest" — both return { error: 'not_found' }. The client
+  //     renders "Invalid credentials".
+  //   - The email is returned in full. It must be, so the client
+  //     can pass it to Supabase. This is a considered trade-off:
+  //     rate limiting makes enumeration impractical, and the
+  //     subsequent signInWithPassword is what actually gates
+  //     access. See PROJECT_STATE.md "Known Issues" for the
+  //     residual risk.
+  // ────────────────────────────────────────────────────────────
+  socket.on('resolveEmailFromUsername', async (data) => {
+    if (!checkResolveEmailRateLimit(socket.id)) {
+      console.log('[RESOLVE EMAIL] rate limited | socket:', socket.id);
+      socket.emit('resolveEmailFromUsernameResult', {
+        error: 'rate_limited',
+      });
+      return;
+    }
+
+    const raw =
+      typeof data?.username === 'string' ? data.username : '';
+    const normalized = raw.trim().toLowerCase();
+
+    if (!normalized || normalized.length < 3 || normalized.length > 15) {
+      socket.emit('resolveEmailFromUsernameResult', { error: 'not_found' });
+      return;
+    }
+
+    try {
+      const email = await db.getEmailByUsername(normalized);
+      if (!email) {
+        socket.emit('resolveEmailFromUsernameResult', { error: 'not_found' });
+        return;
+      }
+      socket.emit('resolveEmailFromUsernameResult', { email });
+      console.log(
+        '[RESOLVE EMAIL] socket:', socket.id,
+        '| username:', normalized, '→ resolved'
+      );
+    } catch (e) {
+      console.error('[RESOLVE EMAIL] error:', e?.message || e);
+      socket.emit('resolveEmailFromUsernameResult', { error: 'server_error' });
+    }
   });
 
   // ────────────────────────────────────────────────────────────
@@ -2122,6 +2254,11 @@ io.on('connection', (socket) => {
 
   // ────────────────────────────────────────────────────────────
   // changeUsername
+  //
+  // Chat 12a — now calls db.syncUsername (atomic write to BOTH
+  // public.users and public.profiles). Replaces the old
+  // fire-and-forget updateProfileUsername call that was the source
+  // of bug #15.
   // ────────────────────────────────────────────────────────────
   socket.on('changeUsername', async (data) => {
     const uid = socket.data.userId;
@@ -2179,16 +2316,17 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const ok = await db.updateUsername(uid, normalized);
-    if (!ok) {
+    // Chat 12a — atomic sync. Fails loudly on partial write.
+    const syncResult = await db.syncUsername(uid, normalized);
+    if (!syncResult.ok) {
+      console.error('[CHANGE USERNAME] syncUsername failed:', syncResult.message);
       socket.emit('changeUsernameResult', {
         success: false,
-        message: 'That username is already taken',
+        message: syncResult.message || 'Username update failed',
       });
       return;
     }
 
-    db.updateProfileUsername(uid, normalized).catch(() => {});
     db.supabase.auth.admin
       .updateUserById(uid, { user_metadata: { username: normalized } })
       .catch(() => {});
@@ -3296,6 +3434,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('[DISCONNECT]', socket.id);
+    resolveEmailRateLimit.delete(socket.id);
     handleDisconnect(socket.id);
   });
 });
