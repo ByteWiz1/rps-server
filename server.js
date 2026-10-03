@@ -8,16 +8,15 @@
 //   - identify reads profiles.is_guest as authoritative.
 //   - Drift heal between public.users and profiles.
 //   - changeUsername uses db.syncUsername (atomic).
-// Chat 12b — Bug C server-side.
-//   - checkUsernameAvailability now has a per-socket rate limit
-//     (30/min). Previously unlimited; typing 8 chars in a burst
-//     could fire 8 requests, and if Supabase was slow they could
-//     stack up.
-//   - The whole handler is wrapped in try/catch with a guaranteed
-//     response on every path (never leaves the client hanging).
-//   - New helper: checkUsernameRateLimit(socketId) with a rolling
-//     60s window, mirroring the resolveEmail rate limiter.
-//   - Cleanup on disconnect for both rate-limit maps.
+// Chat 12b — rate limit + try/catch on checkUsernameAvailability.
+// Chat 12c — Onboarding gate reverted.
+//   - Live username propagation on identify. When a guest upgrades
+//     and their username changes, we now also re-broadcast the state
+//     of any active (non-tournament) room they are in, so opponents
+//     see the new name immediately. Previously only the onlineUsers
+//     list and tournament state were refreshed.
+//   - Everything else is unchanged. The tournament engine, battle
+//     modes, and match recording are byte-identical to Chat 12b.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -331,6 +330,51 @@ function checkCheckUsernameRateLimit(socketId) {
   fresh.push(now);
   checkUsernameRateLimit.set(socketId, fresh);
   return true;
+}
+
+// ─── Chat 12c — propagate a username change to live room state ───
+//
+// Called from identify after we determine the user's current
+// username. For every active (non-tournament) room the user is
+// connected to, re-broadcast roomState so their opponents see the
+// new name immediately. Tournament rooms are covered separately by
+// the tournamentState re-emit that identify already performs.
+function propagateUsernameToLiveRooms(userId) {
+  if (!userId) return 0;
+  let touched = 0;
+
+  // Find every socket for this user, then every room those sockets
+  // are in.
+  const seenRoomCodes = new Set();
+  for (const [socketId, entry] of onlinePlayers) {
+    if (entry.userId !== userId) continue;
+    const player = players.get(socketId);
+    if (!player || !player.room) continue;
+    if (seenRoomCodes.has(player.room)) continue;
+    seenRoomCodes.add(player.room);
+
+    const room = rooms.get(player.room);
+    if (!room) continue;
+
+    // Tournament rooms get a roomState too — harmless, and it keeps
+    // the live scoreboard consistent with the new name.
+    try {
+      broadcastRoomState(room);
+      touched++;
+      console.log(
+        '[USERNAME PROPAGATE] re-broadcast roomState |',
+        'room:', room.code,
+        '| userId:', userId
+      );
+    } catch (e) {
+      console.error(
+        '[USERNAME PROPAGATE] broadcastRoomState failed:',
+        e?.message
+      );
+    }
+  }
+
+  return touched;
 }
 
 // ─── AI state setup ───
@@ -1913,6 +1957,12 @@ io.on('connection', (socket) => {
       db.updateProfileUsername(uid, user.username, user.avatar).catch(() => {});
     }
 
+    // Detect a username change for propagation.
+    const previousUsername =
+      onlinePlayers.get(socket.id)?.username || null;
+    const usernameChanged =
+      previousUsername && previousUsername !== user.username;
+
     for (const [existingSocketId, existingPlayer] of onlinePlayers) {
       if (existingPlayer.userId === uid && existingSocketId !== socket.id) {
         console.log('[SESSION REPLACED]', existingSocketId, '→', socket.id, `(${uid})`);
@@ -1964,6 +2014,40 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
+    // Chat 12c — propagate a live username change to active rooms.
+    // Runs unconditionally on identify; harmless when the username
+    // has not changed (the roomState broadcast is idempotent).
+    try {
+      propagateUsernameToLiveRooms(uid);
+    } catch (e) {
+      console.error('[IDENTIFY] propagateUsernameToLiveRooms failed:', e?.message);
+    }
+
+    // If the username changed, re-broadcast tournament state so
+    // lobby/bracket views show the new name immediately.
+    if (usernameChanged) {
+      console.log(
+        '[IDENTIFY] username changed | uid:', uid,
+        '| was:', previousUsername,
+        '| now:', user.username
+      );
+      for (const [, t] of tournaments) {
+        if (t.players.includes(uid)) {
+          try {
+            io.to('tournament:' + t.id).emit(
+              'tournamentState',
+              tournamentEngine.publicState(t)
+            );
+          } catch (e) {
+            console.error(
+              '[IDENTIFY] re-emit tournamentState failed:',
+              e?.message
+            );
+          }
+        }
+      }
+    }
+
     const stats = await db.getOrCreateStats(uid);
     socket.emit('playerStats', { stats });
 
@@ -1992,7 +2076,6 @@ io.on('connection', (socket) => {
 
     socket.emit('avatars', { avatars });
 
-    // Resolve guest/member from profiles.is_guest.
     const payload = socket.data.jwtPayload || {};
     const meta = payload.user_metadata || {};
     const jwtSaysAnon = !payload.email || meta.is_anonymous === true;
@@ -2108,13 +2191,9 @@ io.on('connection', (socket) => {
   });
 
   // ────────────────────────────────────────────────────────────
-  // checkUsernameAvailability (Chat 12b — rate limited + try/catch)
+  // checkUsernameAvailability
   // ────────────────────────────────────────────────────────────
   socket.on('checkUsernameAvailability', async (data) => {
-    // Rate limit. The client debounces at 300ms and 30/min is a
-    // comfortable ceiling for normal typing. If a client is firing
-    // faster than that, they are either buggy or malicious — respond
-    // with a definite negative so the UI does not hang.
     if (!checkCheckUsernameRateLimit(socket.id)) {
       console.log(
         '[USERNAME CHECK] rate limited | socket:', socket.id
@@ -2158,8 +2237,6 @@ io.on('connection', (socket) => {
         message: available ? undefined : 'That username is already taken',
       });
     } catch (e) {
-      // Never leave the client hanging. Emit a definite negative
-      // with a clear message.
       console.error('[USERNAME CHECK] error:', e?.message);
       socket.emit('usernameAvailability', {
         username: raw,
@@ -2267,6 +2344,13 @@ io.on('connection', (socket) => {
     }
 
     broadcastOnlineUsers();
+
+    // Also re-broadcast any active room this user is in.
+    try {
+      propagateUsernameToLiveRooms(uid);
+    } catch (e) {
+      console.error('[CHANGE USERNAME] propagateUsernameToLiveRooms failed:', e?.message);
+    }
 
     socket.emit('changeUsernameResult', {
       success: true,
