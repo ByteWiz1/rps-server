@@ -4,19 +4,23 @@
 //
 // Chat 11e — Active window removed.
 // Chat 12a — Onboarding + identity model.
-//   - resolveEmailFromUsername socket event with per-socket rate limit.
-//   - identify reads profiles.is_guest as authoritative.
-//   - Drift heal between public.users and profiles.
-//   - changeUsername uses db.syncUsername (atomic).
 // Chat 12b — rate limit + try/catch on checkUsernameAvailability.
-// Chat 12c — Onboarding gate reverted.
-//   - Live username propagation on identify. When a guest upgrades
-//     and their username changes, we now also re-broadcast the state
-//     of any active (non-tournament) room they are in, so opponents
-//     see the new name immediately. Previously only the onlineUsers
-//     list and tournament state were refreshed.
-//   - Everything else is unchanged. The tournament engine, battle
-//     modes, and match recording are byte-identical to Chat 12b.
+// Chat 12c — Onboarding gate reverted. Live username propagation.
+// Chat 12d — Tournament bug fix.
+//   BUG A: generic bracket advance for all N (2-32), human+avatar.
+//     - checkRoundComplete winners = match winners + BYE, finishes
+//       only when winners.length === 1.
+//     - Removed `matches.length === 0 && bye → finishTournament`
+//       shortcut; BYE players are carried into the next round and
+//       only crowned when they are the sole remaining participant.
+//     - Defensive guards A–G (see comments).
+//   BUG B: BYE player score broadcast.
+//     - broadcastScores emits to every participant's sockets in
+//       addition to the tournament room.
+//     - beginRound re-joins every active participant's sockets to
+//       tournament:<id>.
+//   BUG C: (client-side) — see TournamentBracketScreen.tsx and
+//     TournamentChampionScreen.tsx.
 //
 // Preserved constants: AVATAR_ROUND_DELAY = 2000, WIN_TARGET = 30,
 //   MAX_HISTORY = 20, MAX_RECENT_MOVES = 5, DISCONNECT_TIMEOUT = 20000,
@@ -333,18 +337,10 @@ function checkCheckUsernameRateLimit(socketId) {
 }
 
 // ─── Chat 12c — propagate a username change to live room state ───
-//
-// Called from identify after we determine the user's current
-// username. For every active (non-tournament) room the user is
-// connected to, re-broadcast roomState so their opponents see the
-// new name immediately. Tournament rooms are covered separately by
-// the tournamentState re-emit that identify already performs.
 function propagateUsernameToLiveRooms(userId) {
   if (!userId) return 0;
   let touched = 0;
 
-  // Find every socket for this user, then every room those sockets
-  // are in.
   const seenRoomCodes = new Set();
   for (const [socketId, entry] of onlinePlayers) {
     if (entry.userId !== userId) continue;
@@ -356,8 +352,6 @@ function propagateUsernameToLiveRooms(userId) {
     const room = rooms.get(player.room);
     if (!room) continue;
 
-    // Tournament rooms get a roomState too — harmless, and it keeps
-    // the live scoreboard consistent with the new name.
     try {
       broadcastRoomState(room);
       touched++;
@@ -877,7 +871,7 @@ function startAvatarAutoPlay(roomCode) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// TOURNAMENT ENGINE (Chat 11) — Active window removed
+// TOURNAMENT ENGINE (Chat 11, hardened Chat 12d)
 // ════════════════════════════════════════════════════════════════
 
 const tournamentEngine = {
@@ -1128,22 +1122,41 @@ const tournamentEngine = {
     return { ok: true };
   },
 
+  // ────────────────────────────────────────────────────────────
+  // beginRound — generic for all N. Guards C, D, G.
+  // ────────────────────────────────────────────────────────────
   async beginRound(state) {
     if (!state) return;
     console.log(
-      '[TOURNAMENT] beginRound — enter | id:', state.id,
+      '[TOURNAMENT ADVANCE] beginRound — enter | id:', state.id,
       '| prevRound:', state.currentRound,
       '| players:', state.players.length
     );
 
+    // Guard D: refuse to start a new round if the previous round
+    // is not complete.
+    const prevRound = state.rounds[state.rounds.length - 1];
+    if (prevRound && prevRound.status !== 'complete') {
+      console.error(
+        '[TOURNAMENT ADVANCE] beginRound — REFUSED | prev round',
+        prevRound.roundNumber, 'status:', prevRound.status
+      );
+      return;
+    }
+
     const activePlayers = [...state.players];
 
     if (activePlayers.length === 0) {
-      console.error('[TOURNAMENT] beginRound — 0 players, aborting');
+      console.error('[TOURNAMENT ADVANCE] beginRound — 0 players, aborting');
       return;
     }
+
+    // Guard C: only finish when there is exactly 1 active player.
     if (activePlayers.length === 1) {
-      console.log('[TOURNAMENT] beginRound — 1 player, finishing tournament');
+      console.log(
+        '[TOURNAMENT ADVANCE] beginRound — 1 player, crowning champion:',
+        activePlayers[0]
+      );
       await this.finishTournament(state, activePlayers[0]);
       return;
     }
@@ -1176,13 +1189,13 @@ const tournamentEngine = {
     }
 
     console.log(
-      '[TOURNAMENT] beginRound — pairings for round', roundNumber,
+      '[TOURNAMENT ADVANCE] beginRound — pairings for round', roundNumber,
       '| matches:', matches.length,
       '| bye:', bye || '(none)'
     );
     for (const m of matches) {
       console.log(
-        '[TOURNAMENT] beginRound — match', m.matchId,
+        '[TOURNAMENT ADVANCE] match', m.matchId,
         '| p1:', m.p1, '| p2:', m.p2, '| room:', m.roomCode
       );
     }
@@ -1194,7 +1207,8 @@ const tournamentEngine = {
       status: 'active',
       startedAt: Date.now(),
       completedAt: null,
-      _completing: false,
+      _evaluated: false,   // Guard A
+      _completing: false,  // in-flight guard
     };
     state.rounds.push(round);
 
@@ -1219,6 +1233,11 @@ const tournamentEngine = {
       this.createTournamentRoom(state, m);
     }
 
+    // Bug B: ensure every active participant's sockets are in the
+    // tournament room, not just the ones who happened to call
+    // getTournament.
+    this.rejoinParticipantsToTournamentRoom(state);
+
     this.broadcastState(state);
 
     io.to('tournament:' + state.id).emit('roundStarted', {
@@ -1233,7 +1252,7 @@ const tournamentEngine = {
       })),
     });
     console.log(
-      '[TOURNAMENT] beginRound — emitted roundStarted | room size:',
+      '[TOURNAMENT ADVANCE] beginRound — emitted roundStarted | room size:',
       (io.sockets.adapter.rooms.get('tournament:' + state.id) || { size: 0 }).size
     );
 
@@ -1243,14 +1262,8 @@ const tournamentEngine = {
 
     this.broadcastScores(state, round);
 
-    if (matches.length === 0 && bye) {
-      console.log('[TOURNAMENT] beginRound — no matches, only a BYE. Advancing.');
-      await this.finishTournament(state, bye);
-      return;
-    }
-
     console.log(
-      '[TOURNAMENT] beginRound — exit | round:', roundNumber,
+      '[TOURNAMENT ADVANCE] beginRound — exit | round:', roundNumber,
       '| matches:', matches.length
     );
   },
@@ -1279,6 +1292,7 @@ const tournamentEngine = {
       aiState: null,
       tournamentId: state.id,
       tournamentMatchId: match.matchId,
+      tournamentRoundNumber: state.currentRound,
       winTarget: state.winTarget,
     };
     rooms.set(roomCode, room);
@@ -1297,21 +1311,74 @@ const tournamentEngine = {
     const m = round.matches.find((x) => x.matchId === room.tournamentMatchId);
     if (!m) return;
     if (m.status === 'active') return;
+    if (m.status === 'complete') {
+      console.log(
+        '[TOURNAMENT ADVANCE] onMatchReady — match', m.matchId,
+        'already complete, ignoring'
+      );
+      return;
+    }
 
     m.status = 'active';
-    console.log('[TOURNAMENT] onMatchReady — match', m.matchId, 'now active');
+    console.log('[TOURNAMENT ADVANCE] onMatchReady — match', m.matchId, 'now active');
     this.broadcastScores(state, round);
   },
 
+  // ────────────────────────────────────────────────────────────
+  // onMatchProgress — Guards E + G.
+  //
+  // Relaxed pending guard: the first progress event for a match
+  // that is still 'pending' promotes it to 'active'. This is
+  // required because in avatar mode the first `roundResult` can
+  // arrive before `onMatchReady` (which is chained off an async
+  // avatar snapshot). Rejects `complete` and stale-round events.
+  // ────────────────────────────────────────────────────────────
   async onMatchProgress(room) {
     if (!room || !room.tournamentId || !room.tournamentMatchId) return;
     const state = await this.get(room.tournamentId);
     if (!state) return;
-    const round = state.rounds[state.rounds.length - 1];
-    if (!round) return;
-    const m = round.matches.find((x) => x.matchId === room.tournamentMatchId);
-    if (!m) return;
-    if (m.status === 'complete') return;
+
+    // Guard E: room must belong to the current round.
+    const currentRound = state.rounds[state.rounds.length - 1];
+    if (!currentRound) {
+      console.warn(
+        '[TOURNAMENT ADVANCE] onMatchProgress — IGNORED (no round) | room:', room.code
+      );
+      return;
+    }
+    if (room.tournamentRoundNumber !== currentRound.roundNumber) {
+      console.warn(
+        '[TOURNAMENT ADVANCE] onMatchProgress — IGNORED (stale round) |',
+        'room:', room.code,
+        '| roomRound:', room.tournamentRoundNumber,
+        '| currentRound:', currentRound.roundNumber
+      );
+      return;
+    }
+
+    const m = currentRound.matches.find((x) => x.matchId === room.tournamentMatchId);
+    if (!m) {
+      console.warn(
+        '[TOURNAMENT ADVANCE] onMatchProgress — IGNORED (match not in current round) |',
+        'room:', room.code, '| match:', room.tournamentMatchId
+      );
+      return;
+    }
+    if (m.status === 'complete') {
+      console.warn(
+        '[TOURNAMENT ADVANCE] onMatchProgress — IGNORED (already complete) |',
+        'match:', m.matchId
+      );
+      return;
+    }
+    // Relaxed pending → active promotion.
+    if (m.status === 'pending') {
+      console.log(
+        '[TOURNAMENT ADVANCE] onMatchProgress — promoting pending → active |',
+        'match:', m.matchId
+      );
+      m.status = 'active';
+    }
 
     const [p1Socket, p2Socket] = room.players;
     const p1UserId = onlinePlayers.get(p1Socket)?.userId || players.get(p1Socket)?.userId;
@@ -1335,17 +1402,17 @@ const tournamentEngine = {
       m.winner = winnerUserId;
       m.status = 'complete';
       console.log(
-        '[TOURNAMENT] onMatchProgress — match', m.matchId,
-        'complete | winner:', winnerUserId
+        '[TOURNAMENT ADVANCE] match complete | match:', m.matchId,
+        '| winner:', winnerUserId, '| round:', currentRound.roundNumber
       );
     }
 
-    this.broadcastScores(state, round);
+    this.broadcastScores(state, currentRound);
     this.broadcastState(state);
-    await this.persistRound(state, round);
+    await this.persistRound(state, currentRound);
 
     if (m.status === 'complete') {
-      await this.checkRoundComplete(state, round);
+      await this.checkRoundComplete(state, currentRound);
     }
   },
 
@@ -1367,6 +1434,9 @@ const tournamentEngine = {
     await this._handleParticipantGone(uid, socketId, 'left');
   },
 
+  // ────────────────────────────────────────────────────────────
+  // _handleParticipantGone — Guard F.
+  // ────────────────────────────────────────────────────────────
   async _handleParticipantGone(userId, socketId, reason) {
     let state = null;
     for (const [, t] of tournaments) {
@@ -1375,11 +1445,12 @@ const tournamentEngine = {
     if (!state) return;
 
     console.log(
-      '[TOURNAMENT] _handleParticipantGone — enter | uid:', userId,
+      '[TOURNAMENT ADVANCE] _handleParticipantGone — enter | uid:', userId,
       '| reason:', reason, '| id:', state.id,
       '| status:', state.status
     );
 
+    // Multi-socket: if the user has another live socket, skip.
     let otherSocketCount = 0;
     for (const [sid, entry] of onlinePlayers) {
       if (entry.userId === userId && sid !== socketId) {
@@ -1388,12 +1459,13 @@ const tournamentEngine = {
     }
     if (otherSocketCount > 0) {
       console.log(
-        '[TOURNAMENT] _handleParticipantGone — user still has',
+        '[TOURNAMENT ADVANCE] _handleParticipantGone — user still has',
         otherSocketCount, 'other live socket(s), skipping removal'
       );
       return;
     }
 
+    // Lobby: existing behaviour.
     if (state.status === 'lobby') {
       state.players = state.players.filter((p) => p !== userId);
       if (state.hostId === userId && state.players.length > 0) {
@@ -1401,26 +1473,36 @@ const tournamentEngine = {
         state.hostId = nextHost;
         db.updateTournament(state.id, { hostId: nextHost }).catch(() => {});
         io.to('tournament:' + state.id).emit('hostChanged', { newHostId: nextHost });
-        console.log('[TOURNAMENT] _handleParticipantGone — host promoted to', nextHost);
+        console.log('[TOURNAMENT ADVANCE] host promoted to', nextHost);
       }
       this.broadcastState(state);
       return;
     }
 
-    state.players = state.players.filter((p) => p !== userId);
-
-    if (state.hostId === userId && state.players.length > 0) {
-      const nextHost = state.players[Math.floor(Math.random() * state.players.length)];
-      state.hostId = nextHost;
-      db.updateTournament(state.id, { hostId: nextHost }).catch(() => {});
-      io.to('tournament:' + state.id).emit('hostChanged', { newHostId: nextHost });
-      console.log('[TOURNAMENT] _handleParticipantGone — host promoted to', nextHost);
+    // Finished: nothing to do.
+    if (state.status === 'finished') {
+      console.log('[TOURNAMENT ADVANCE] _handleParticipantGone — finished, skipping');
+      return;
     }
 
+    // Live: determine whether this user is currently in an active
+    // match in the current round.
     const round = state.rounds[state.rounds.length - 1];
-    if (round && round.status !== 'complete') {
+    const inActiveMatch = !!(round && round.status === 'active' &&
+      round.matches.some(
+        (m) => m.status === 'active' &&
+          (m.p1 === userId || m.p2 === userId)
+      ));
+
+    console.log(
+      '[TOURNAMENT ADVANCE] _handleParticipantGone — inActiveMatch:', inActiveMatch,
+      '| round:', round?.roundNumber, '| roundStatus:', round?.status
+    );
+
+    if (inActiveMatch) {
+      // Mid-match: walkover for that match only.
       for (const m of round.matches) {
-        if (m.status === 'complete') continue;
+        if (m.status !== 'active') continue;
         if (m.p1 === userId && m.p2 !== userId) {
           m.winner = m.p2;
           m.status = 'complete';
@@ -1433,19 +1515,75 @@ const tournamentEngine = {
       }
       this.broadcastScores(state, round);
       await this.persistRound(state, round);
+    } else {
+      // Between rounds: just remove from the participant list. Do
+      // NOT fabricate a walkover for a match that hasn't started.
+      console.log(
+        '[TOURNAMENT ADVANCE] _handleParticipantGone — between rounds, ' +
+        'removing uid from participants without walkover'
+      );
+    }
+
+    // Remove from state.players regardless.
+    const before = state.players.length;
+    state.players = state.players.filter((p) => p !== userId);
+    const after = state.players.length;
+    console.log(
+      '[TOURNAMENT ADVANCE] _handleParticipantGone — players:', before, '→', after
+    );
+
+    // Host promotion if needed.
+    if (state.hostId === userId && state.players.length > 0) {
+      const nextHost = state.players[Math.floor(Math.random() * state.players.length)];
+      state.hostId = nextHost;
+      db.updateTournament(state.id, { hostId: nextHost }).catch(() => {});
+      io.to('tournament:' + state.id).emit('hostChanged', { newHostId: nextHost });
+      console.log('[TOURNAMENT ADVANCE] host promoted to', nextHost);
     }
 
     this.broadcastState(state);
 
-    if (state.players.length <= 1) {
-      await this.finishTournament(state, state.players[0] || null);
-      return;
+    // Guard C: only finish when exactly one player remains AND the
+    // current round is complete (or there is no active round).
+    if (state.players.length === 1) {
+      const r = state.rounds[state.rounds.length - 1];
+      if (!r || r.status === 'complete') {
+        await this.finishTournament(state, state.players[0]);
+        return;
+      }
+      console.log(
+        '[TOURNAMENT ADVANCE] _handleParticipantGone — 1 player remains but round',
+        r.roundNumber, 'is', r.status, '— deferring finish to checkRoundComplete'
+      );
     }
-    if (round) await this.checkRoundComplete(state, round);
+
+    if (round && round.status === 'active') {
+      await this.checkRoundComplete(state, round);
+    }
   },
 
+  // ────────────────────────────────────────────────────────────
+  // _cancelTournamentRoom — Guard B.
+  //
+  // Refuses to cancel a match that was never active. The caller
+  // (mid-match walkover path) only invokes this after setting
+  // match.status = 'complete', so the guard below is satisfied
+  // there; the guard protects against any stray call where a
+  // pending match is passed in.
+  // ────────────────────────────────────────────────────────────
   _cancelTournamentRoom(match, winnerUserId, reason) {
     if (!match || !match.roomCode) return;
+
+    // Guard B: only cancel matches that are already marked
+    // complete (the walkover path sets this before calling).
+    if (match.status !== 'complete') {
+      console.warn(
+        '[TOURNAMENT ADVANCE] _cancelTournamentRoom — REFUSED |',
+        'match:', match.matchId, 'status:', match.status
+      );
+      return;
+    }
+
     const room = rooms.get(match.roomCode);
     if (!room) return;
     if (room.matchOver) return;
@@ -1474,14 +1612,33 @@ const tournamentEngine = {
     clearAvatarAI(room);
 
     console.log(
-      '[TOURNAMENT] _cancelTournamentRoom — room:', room.code,
+      '[TOURNAMENT ADVANCE] _cancelTournamentRoom — room:', room.code,
       '| winner:', winnerUserId || '(none)', '| reason:', reason
     );
   },
 
+  // ────────────────────────────────────────────────────────────
+  // checkRoundComplete — Guards A + C + D + G.
+  // ────────────────────────────────────────────────────────────
   async checkRoundComplete(state, round) {
-    if (!round || round.status === 'complete') return;
-    if (round._completing) return;
+    if (!round) return;
+
+    // Guard A: idempotency.
+    if (round._evaluated || round.status === 'complete') {
+      console.warn(
+        '[TOURNAMENT ADVANCE] checkRoundComplete — IGNORED (already evaluated) |',
+        'round:', round.roundNumber, '| status:', round.status,
+        '| _evaluated:', round._evaluated
+      );
+      return;
+    }
+    if (round._completing) {
+      console.warn(
+        '[TOURNAMENT ADVANCE] checkRoundComplete — IGNORED (in flight) |',
+        'round:', round.roundNumber
+      );
+      return;
+    }
     round._completing = true;
 
     const allResolved = round.matches.every((m) => m.status === 'complete');
@@ -1491,20 +1648,28 @@ const tournamentEngine = {
     }
 
     console.log(
-      '[TOURNAMENT] checkRoundComplete — round', round.roundNumber,
-      'complete | winners will advance'
+      '[TOURNAMENT ADVANCE] round complete | round:', round.roundNumber,
+      '| matches:', round.matches.length, '| bye:', round.bye || '(none)'
     );
 
+    round._evaluated = true;
     round.status = 'complete';
     round.completedAt = Date.now();
 
+    // Winners = every match winner + the BYE player (if any).
     const winners = [];
     for (const m of round.matches) {
       if (m.winner) winners.push(m.winner);
     }
     if (round.bye) winners.push(round.bye);
 
-    state.players = Array.from(new Set(winners));
+    const uniqueWinners = Array.from(new Set(winners));
+    console.log(
+      '[TOURNAMENT ADVANCE] winners computed | round:', round.roundNumber,
+      '| winners:', uniqueWinners.length, '| ids:', uniqueWinners.join(', ')
+    );
+
+    state.players = uniqueWinners;
 
     await db.updateTournamentRound(state.id, round.roundNumber, {
       status: 'complete',
@@ -1522,62 +1687,129 @@ const tournamentEngine = {
 
     io.to('tournament:' + state.id).emit('roundComplete', {
       roundNumber: round.roundNumber,
-      winners,
-      nextRound: state.players.length > 1 ? round.roundNumber + 1 : null,
+      winners: uniqueWinners,
+      nextRound: uniqueWinners.length > 1 ? round.roundNumber + 1 : null,
     });
 
     this.broadcastState(state);
 
-    if (state.players.length <= 1) {
-      await this.finishTournament(state, state.players[0] || null);
+    // Guard C: finish only when exactly 1 winner remains.
+    if (uniqueWinners.length === 1) {
+      console.log(
+        '[TOURNAMENT ADVANCE] single winner → finish |',
+        'round:', round.roundNumber, '| champion:', uniqueWinners[0]
+      );
+      round._completing = false;
+      await this.finishTournament(state, uniqueWinners[0]);
+      return;
+    }
+
+    if (uniqueWinners.length === 0) {
+      console.error(
+        '[TOURNAMENT ADVANCE] checkRoundComplete — 0 winners, cannot advance |',
+        'round:', round.roundNumber
+      );
+      round._completing = false;
+      return;
+    }
+
+    // Guard D: previous round must be complete before advancing.
+    if (round.status !== 'complete') {
+      console.error(
+        '[TOURNAMENT ADVANCE] checkRoundComplete — round status not complete, refusing to advance'
+      );
+      round._completing = false;
       return;
     }
 
     if (state.autoAdvance) {
       state.pendingNextRound = true;
-      console.log('[TOURNAMENT] checkRoundComplete — auto-advancing in 4s');
+      console.log(
+        '[TOURNAMENT ADVANCE] auto-advancing in 4s | round:', round.roundNumber,
+        '→ round:', round.roundNumber + 1
+      );
       setTimeout(() => {
         state.pendingNextRound = false;
         this.beginRound(state).catch((e) =>
-          console.error('[TOURNAMENT] autoAdvance beginRound failed:', e?.message)
+          console.error('[TOURNAMENT ADVANCE] autoAdvance beginRound failed:', e?.message)
         );
       }, 4000);
     } else {
       state.pendingNextRound = false;
-      console.log('[TOURNAMENT] checkRoundComplete — waiting for host to begin next round');
+      console.log(
+        '[TOURNAMENT ADVANCE] waiting for host to begin next round | round:',
+        round.roundNumber
+      );
     }
+
+    round._completing = false;
   },
 
+  // ────────────────────────────────────────────────────────────
+  // finishTournament — Guard C.
+  // ────────────────────────────────────────────────────────────
   async finishTournament(state, championUserId) {
     if (!state) return;
-    if (state.status === 'finished') return;
+    if (state.status === 'finished') {
+      console.warn(
+        '[TOURNAMENT ADVANCE] finishTournament — IGNORED (already finished) |',
+        'id:', state.id
+      );
+      return;
+    }
+
+    // Guard C: assert exactly one player remains.
+    if (!championUserId) {
+      console.error(
+        '[TOURNAMENT ADVANCE] finishTournament — REFUSED (no champion) |',
+        'id:', state.id, '| players:', state.players.length
+      );
+      return;
+    }
+    if (state.players.length !== 1) {
+      console.error(
+        '[TOURNAMENT ADVANCE] finishTournament — REFUSED (players.length =',
+        state.players.length, ', expected 1) | id:', state.id,
+        '| players:', state.players.join(', ')
+      );
+      return;
+    }
+    if (state.players[0] !== championUserId) {
+      console.error(
+        '[TOURNAMENT ADVANCE] finishTournament — REFUSED (champion mismatch) |',
+        'id:', state.id, '| state.players[0]:', state.players[0],
+        '| championUserId:', championUserId
+      );
+      return;
+    }
 
     console.log(
-      '[TOURNAMENT] finishTournament — enter | id:', state.id,
-      '| champion:', championUserId
+      '[TOURNAMENT ADVANCE] finishTournament — enter | id:', state.id,
+      '| champion:', championUserId,
+      '| rounds played:', state.rounds.length
     );
 
     state.status = 'finished';
-    state.winnerId = championUserId || null;
+    state.winnerId = championUserId;
 
     await db.updateTournament(state.id, {
       status: 'finished',
-      winnerId: championUserId || null,
+      winnerId: championUserId,
     });
 
     const rewards = await this.applyRewards(state, championUserId);
 
     io.to('tournament:' + state.id).emit('tournamentComplete', {
-      winnerId: championUserId || null,
+      winnerId: championUserId,
       rewards,
     });
 
-    console.log('[TOURNAMENT] finishTournament — exit | champion:', championUserId);
+    console.log('[TOURNAMENT ADVANCE] finishTournament — exit | champion:', championUserId);
 
     setTimeout(() => {
       tournaments.delete(state.id);
       tournamentCodes.delete(state.code);
-      console.log('[TOURNAMENT] finishTournament — evicted from memory | id:', state.id);
+      console.log('[TOURNAMENT ADVANCE] evicted from memory | id:', state.id);
     }, 10 * 60 * 1000);
   },
 
@@ -1664,6 +1896,9 @@ const tournamentEngine = {
     io.to('tournament:' + state.id).emit('tournamentState', this.publicState(state));
   },
 
+  // ────────────────────────────────────────────────────────────
+  // broadcastScores — Bug B.
+  // ────────────────────────────────────────────────────────────
   broadcastScores(state, round) {
     if (!state || !round) return;
     const payload = {};
@@ -1681,9 +1916,18 @@ const tournamentEngine = {
       '[TOURNAMENT] broadcastScores | id:', state.id,
       '| round:', round.roundNumber,
       '| matches:', round.matches.length,
-      '| room size:', roomSize
+      '| room size:', roomSize,
+      '| participants:', state.players.length
     );
     io.to('tournament:' + state.id).emit('tournamentScoresUpdate', payload);
+
+    // Explicit per-participant emit as a safety net (Bug B).
+    for (const uid of state.players) {
+      const sockets = this.socketsForUser(uid);
+      for (const sid of sockets) {
+        io.to(sid).emit('tournamentScoresUpdate', payload);
+      }
+    }
   },
 
   emitMatchAssigned(state, match) {
@@ -1712,6 +1956,28 @@ const tournamentEngine = {
       if (entry.userId === userId) out.push(socketId);
     }
     return out;
+  },
+
+  // Bug B: re-join every active participant's sockets to the
+  // tournament room. Called at the top of every beginRound.
+  rejoinParticipantsToTournamentRoom(state) {
+    if (!state) return;
+    let joined = 0;
+    for (const uid of state.players) {
+      const sockets = this.socketsForUser(uid);
+      for (const sid of sockets) {
+        const s = io.sockets.sockets.get(sid);
+        if (s) {
+          s.join('tournament:' + state.id);
+          joined++;
+        }
+      }
+    }
+    console.log(
+      '[TOURNAMENT ADVANCE] rejoinParticipantsToTournamentRoom | id:', state.id,
+      '| participants:', state.players.length,
+      '| sockets joined:', joined
+    );
   },
 
   shuffle(arr) {
@@ -1909,7 +2175,6 @@ io.on('connection', (socket) => {
     const clientUsernameRaw = (data?.username || '').trim().slice(0, 15);
     const clientAvatar = data?.avatar || null;
 
-    // Drift heal.
     let usernameToUse = profile?.username || null;
     try {
       const account = await db.getUserById(uid);
@@ -1957,7 +2222,6 @@ io.on('connection', (socket) => {
       db.updateProfileUsername(uid, user.username, user.avatar).catch(() => {});
     }
 
-    // Detect a username change for propagation.
     const previousUsername =
       onlinePlayers.get(socket.id)?.username || null;
     const usernameChanged =
@@ -2014,17 +2278,12 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
     broadcastOnlineCount();
 
-    // Chat 12c — propagate a live username change to active rooms.
-    // Runs unconditionally on identify; harmless when the username
-    // has not changed (the roomState broadcast is idempotent).
     try {
       propagateUsernameToLiveRooms(uid);
     } catch (e) {
       console.error('[IDENTIFY] propagateUsernameToLiveRooms failed:', e?.message);
     }
 
-    // If the username changed, re-broadcast tournament state so
-    // lobby/bracket views show the new name immediately.
     if (usernameChanged) {
       console.log(
         '[IDENTIFY] username changed | uid:', uid,
@@ -2345,7 +2604,6 @@ io.on('connection', (socket) => {
 
     broadcastOnlineUsers();
 
-    // Also re-broadcast any active room this user is in.
     try {
       propagateUsernameToLiveRooms(uid);
     } catch (e) {
@@ -2753,6 +3011,7 @@ io.on('connection', (socket) => {
         aiState: null,
         tournamentId: null,
         tournamentMatchId: null,
+        tournamentRoundNumber: null,
         winTarget: WIN_TARGET,
       };
       rooms.set(roomCode, room);
@@ -2973,6 +3232,7 @@ io.on('connection', (socket) => {
       aiState: null,
       tournamentId: tournamentId,
       tournamentMatchId: tournamentMatchId,
+      tournamentRoundNumber: null,
       winTarget: WIN_TARGET,
     };
     rooms.set(roomCode, room);
@@ -3565,4 +3825,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-// rps-server/server.js
